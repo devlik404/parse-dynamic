@@ -1,0 +1,56 @@
+# =====================
+# Environment variables
+# =====================
+.env
+.env.*
+!.env.example
+
+# =====================
+# Go build artifacts
+# =====================
+bin/
+build/
+dist/
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+
+# =====================
+# Go test & coverage
+# =====================
+*.test
+*.out
+coverage/
+coverage.out
+
+# =====================
+# Go workspace
+# =====================
+go.work
+go.work.sum
+
+# =====================
+# Dependency cache
+# =====================
+vendor/
+
+# =====================
+# Logs
+# =====================
+*.log
+logs/
+
+# =====================
+# OS files
+# =====================
+.DS_Store
+Thumbs.db
+
+# =====================
+# Editor / IDE
+# =====================
+.vscode/
+.idea/
+*.swp
