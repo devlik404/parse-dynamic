@@ -10,4 +10,5 @@ RUN CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags="-s -w" -o /out/parser-
 FROM gcr.io/distroless/static-debian12:nonroot
 COPY --from=build /out/parser-job /parser-job
 USER nonroot:nonroot
+EXPOSE 8080
 ENTRYPOINT ["/parser-job"]

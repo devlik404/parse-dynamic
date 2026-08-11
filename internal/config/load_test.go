@@ -71,6 +71,93 @@ func TestLoadDelimitedComplete(t *testing.T) {
 	}
 }
 
+func TestLoadParserDoesNotRequireInputOrDatabaseConfiguration(t *testing.T) {
+	env := map[string]string{
+		"PARSER_FILE_TYPE":  "DELIMITED",
+		"PARSER_DELIMITER":  "|",
+		"PARSER_HAS_HEADER": "true",
+		"PARSER_COLUMNS":    "id,amount",
+		"PARSER_TYPES":      "string,decimal",
+		"PARSER_MAPPING":    "ID:id,AMOUNT:amount",
+		"PARSER_TRIM_SPACE": "true",
+		"SKIP_EMPTY_LINE":   "false",
+		"DB_PASSWORD":       "must-be-ignored",
+		"ERROR_OUTPUT_PATH": "/must/not/be/required",
+	}
+
+	cfg, err := LoadParser(mapLookup(env))
+	if err != nil {
+		t.Fatalf("LoadParser() error = %v", err)
+	}
+	if cfg.FileType != FileTypeDelimited || cfg.Delimiter != "|" || cfg.SkipEmptyLine || !cfg.TrimSpace {
+		t.Fatalf("unexpected parser config: %+v", cfg)
+	}
+	assertMappings(t, cfg.Mappings, []FieldMapping{{"ID", "id"}, {"AMOUNT", "amount"}})
+}
+
+func TestLoadParserStillFailsFastForParserErrors(t *testing.T) {
+	env := map[string]string{
+		"PARSER_FILE_TYPE":  "CSV",
+		"PARSER_HAS_HEADER": "invalid",
+		"PARSER_COLUMNS":    "id",
+		"PARSER_TYPES":      "unknown",
+	}
+
+	_, err := LoadParser(mapLookup(env))
+	if err == nil {
+		t.Fatal("LoadParser() error = nil")
+	}
+	for _, key := range []string{"PARSER_HAS_HEADER", "PARSER_TYPES"} {
+		if !strings.Contains(err.Error(), key) {
+			t.Fatalf("LoadParser() error = %v, want %s", err, key)
+		}
+	}
+}
+
+func TestLoadParserSectionedDelimited(t *testing.T) {
+	env := map[string]string{
+		"PARSER_FILE_TYPE":               "sectioned_delimited",
+		"PARSER_DELIMITER":               "|",
+		"PARSER_COLUMNS":                 "record_type,section_key,payload",
+		"PARSER_TYPES":                   "string,string,json",
+		"PARSER_FILE_HEADER_CODE":        "RH",
+		"PARSER_SECTION_HEADER_CODE":     "SH",
+		"PARSER_DATA_CODE":               "SB",
+		"PARSER_SECTION_FOOTER_CODE":     "SF",
+		"PARSER_FILE_FOOTER_CODE":        "RF",
+		"PARSER_DUPLICATE_HEADER_POLICY": "suffix_index",
+	}
+
+	cfg, err := LoadParser(mapLookup(env))
+	if err != nil {
+		t.Fatalf("LoadParser() error = %v", err)
+	}
+	if cfg.FileType != FileTypeSectionedDelimited || cfg.Sectioned.RecordTypeIndex != 0 || cfg.Sectioned.SectionKeyIndex != 1 {
+		t.Fatalf("unexpected section indexes: %+v", cfg.Sectioned)
+	}
+	if cfg.Sectioned.FileHeaderCode != "RH" || cfg.Sectioned.SectionHeaderCode != "SH" || cfg.Sectioned.DataCode != "SB" || cfg.Sectioned.SectionFooterCode != "SF" || cfg.Sectioned.FileFooterCode != "RF" {
+		t.Fatalf("unexpected section codes: %+v", cfg.Sectioned)
+	}
+	if cfg.Sectioned.HeaderStartIndex != 2 || cfg.Sectioned.DataStartIndex != 2 || cfg.Sectioned.DuplicateHeaderPolicy != DuplicateHeaderSuffixIndex {
+		t.Fatalf("unexpected section settings: %+v", cfg.Sectioned)
+	}
+	assertMappings(t, cfg.Mappings, []FieldMapping{{"record_type", "record_type"}, {"section_key", "section_key"}, {"payload", "payload"}})
+}
+
+func TestLoadParserSectionedDelimitedRequiresConfiguredRecordCodes(t *testing.T) {
+	env := map[string]string{
+		"PARSER_FILE_TYPE": "SECTIONED_DELIMITED",
+		"PARSER_DELIMITER": "|",
+		"PARSER_COLUMNS":   "payload",
+		"PARSER_TYPES":     "json",
+		"PARSER_MAPPING":   "payload:payload",
+	}
+	_, err := LoadParser(mapLookup(env))
+	if err == nil || !strings.Contains(err.Error(), "PARSER_SECTION_HEADER_CODE") || !strings.Contains(err.Error(), "PARSER_DATA_CODE") {
+		t.Fatalf("LoadParser() error = %v", err)
+	}
+}
+
 func TestLoadNormalizesEveryFormat(t *testing.T) {
 	tests := []struct {
 		name  string

@@ -11,6 +11,8 @@ import (
 	"os/signal"
 	"syscall"
 
+	"github.com/joho/godotenv"
+
 	"parser-engine/internal/config"
 	"parser-engine/internal/repository"
 	"parser-engine/internal/repository/sqlrepo"
@@ -18,10 +20,23 @@ import (
 )
 
 func main() {
+	// Local development may use .env; existing OS/Kubernetes values retain
+	// precedence because godotenv.Load does not overwrite populated variables.
+	_ = godotenv.Load()
+
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
-	if err := run(ctx, os.Stdout); err != nil {
-		log.Printf("parser job failed: %v", err)
+	mode, err := applicationMode(os.LookupEnv)
+	if err == nil {
+		switch mode {
+		case applicationModeHTTP:
+			err = runHTTP(ctx)
+		default:
+			err = run(ctx, os.Stdout)
+		}
+	}
+	if err != nil {
+		log.Printf("parser application failed: %v", err)
 		os.Exit(1)
 	}
 }

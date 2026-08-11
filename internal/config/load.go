@@ -29,6 +29,25 @@ func LoadFromEnv() (JobConfig, error) {
 	return Load(os.LookupEnv)
 }
 
+// LoadParser loads only the format/schema portion of a job configuration.
+// It is intended for read-only preview flows where input and database settings
+// are supplied by infrastructure rather than by the parser configuration.
+func LoadParser(lookup LookupFunc) (ParserConfig, error) {
+	if lookup == nil {
+		return ParserConfig{}, &ConfigError{Problems: []string{"configuration lookup function must not be nil"}}
+	}
+
+	l := envLoader{lookup: lookup}
+	skipEmptyLine := l.boolAlias("INPUT_SKIP_EMPTY_LINE", "SKIP_EMPTY_LINE", true)
+	cfg := loadParserConfig(&l, skipEmptyLine)
+	problems := append([]string(nil), l.problems...)
+	problems = append(problems, validateParserProblems(cfg)...)
+	if len(problems) > 0 {
+		return ParserConfig{}, newConfigError(problems)
+	}
+	return cfg, nil
+}
+
 // Load reads configuration through lookup. Invalid values are reported rather
 // than silently replaced by defaults.
 func Load(lookup LookupFunc) (JobConfig, error) {
@@ -42,16 +61,6 @@ func Load(lookup LookupFunc) (JobConfig, error) {
 			FilePattern:   "*",
 			SkipEmptyLine: true,
 		},
-		Parser: ParserConfig{
-			FixedWidthUnit: "BYTE",
-			JSONMode:       JSONModeAuto,
-			DateFormat:     "2006-01-02",
-			DateTimeFormat: time.RFC3339,
-			Timezone:       "UTC",
-			DefaultValues:  make(map[string]string),
-			MaxRecordBytes: defaultMaxRecordBytes,
-			MaxFields:      defaultMaxFields,
-		},
 		DB: DBConfig{
 			BatchSize:      defaultBatchSize,
 			BatchMaxBytes:  defaultBatchMaxBytes,
@@ -63,76 +72,7 @@ func Load(lookup LookupFunc) (JobConfig, error) {
 	cfg.Input.Path = l.stringValue("INPUT_PATH", "")
 	cfg.Input.FilePattern = l.stringValue("FILE_PATTERN", cfg.Input.FilePattern)
 	cfg.Input.SkipEmptyLine = l.boolAlias("INPUT_SKIP_EMPTY_LINE", "SKIP_EMPTY_LINE", cfg.Input.SkipEmptyLine)
-	cfg.Parser.SkipEmptyLine = cfg.Input.SkipEmptyLine
-
-	cfg.Parser.FileType = FileType(strings.ToUpper(l.stringValue("PARSER_FILE_TYPE", "")))
-	cfg.Parser.Delimiter = l.delimiter("PARSER_DELIMITER")
-	cfg.Parser.HasHeader = l.boolValue("PARSER_HAS_HEADER", false)
-	cfg.Parser.FixedWidthUnit = strings.ToUpper(l.stringValue("PARSER_FIXED_WIDTH_UNIT", cfg.Parser.FixedWidthUnit))
-	cfg.Parser.JSONMode = JSONMode(strings.ToUpper(l.stringValue("PARSER_JSON_MODE", string(cfg.Parser.JSONMode))))
-	cfg.Parser.JSONRecordPath = l.stringValue("PARSER_JSON_RECORD_PATH", "")
-	cfg.Parser.XMLRecordPath = l.stringValue("PARSER_XML_RECORD_PATH", "")
-	cfg.Parser.DateFormat = l.stringValue("PARSER_DATE_FORMAT", cfg.Parser.DateFormat)
-	cfg.Parser.DateTimeFormat = l.stringValue("PARSER_DATETIME_FORMAT", cfg.Parser.DateTimeFormat)
-	cfg.Parser.Timezone = l.stringValue("PARSER_TIMEZONE", cfg.Parser.Timezone)
-	cfg.Parser.TrimSpace = l.boolValue("PARSER_TRIM_SPACE", false)
-	cfg.Parser.NullIfEmpty = l.boolValue("PARSER_NULL_IF_EMPTY", false)
-	cfg.Parser.AllowExtraColumns = l.boolValue("PARSER_ALLOW_EXTRA_COLUMNS", false)
-	cfg.Parser.MaxRecordBytes = l.intValue("PARSER_MAX_RECORD_BYTES", cfg.Parser.MaxRecordBytes)
-	cfg.Parser.MaxFields = l.intValue("PARSER_MAX_FIELDS", cfg.Parser.MaxFields)
-	cfg.Parser.UppercaseFields = l.list("PARSER_UPPERCASE_FIELDS")
-	cfg.Parser.LowercaseFields = l.list("PARSER_LOWERCASE_FIELDS")
-	cfg.Parser.RequiredFields = l.list("PARSER_REQUIRED_FIELDS")
-	cfg.Parser.DefaultValues = l.stringMap("PARSER_DEFAULT_VALUES")
-	cfg.Parser.Transforms = l.transforms()
-
-	columnNames := l.list("PARSER_COLUMNS")
-	columnTypes := l.dataTypes("PARSER_TYPES")
-	if len(columnNames) != len(columnTypes) && (len(columnNames) > 0 || len(columnTypes) > 0) {
-		l.problem("PARSER_COLUMNS and PARSER_TYPES must contain the same number of entries")
-	}
-	for index, name := range columnNames {
-		dataType := DataType("")
-		if index < len(columnTypes) {
-			dataType = columnTypes[index]
-		}
-		cfg.Parser.Columns = append(cfg.Parser.Columns, ColumnSpec{Name: name, Type: dataType})
-	}
-
-	genericMappings, genericSet := l.mappings("PARSER_MAPPING")
-	jsonMappings, jsonSet := l.mappings("PARSER_JSON_MAPPING")
-	xmlMappings, xmlSet := l.mappings("PARSER_XML_MAPPING")
-	switch cfg.Parser.FileType {
-	case FileTypeJSON:
-		if jsonSet {
-			cfg.Parser.Mappings = jsonMappings
-		} else {
-			cfg.Parser.Mappings = genericMappings
-		}
-	case FileTypeXML:
-		if xmlSet {
-			cfg.Parser.Mappings = xmlMappings
-		} else {
-			cfg.Parser.Mappings = genericMappings
-		}
-	default:
-		cfg.Parser.Mappings = genericMappings
-		if jsonSet {
-			l.problem("PARSER_JSON_MAPPING is only valid when PARSER_FILE_TYPE=JSON")
-		}
-		if xmlSet {
-			l.problem("PARSER_XML_MAPPING is only valid when PARSER_FILE_TYPE=XML")
-		}
-	}
-	if genericSet && jsonSet && cfg.Parser.FileType == FileTypeJSON {
-		l.problem("set only one of PARSER_MAPPING and PARSER_JSON_MAPPING for JSON input")
-	}
-	if genericSet && xmlSet && cfg.Parser.FileType == FileTypeXML {
-		l.problem("set only one of PARSER_MAPPING and PARSER_XML_MAPPING for XML input")
-	}
-
-	cfg.Parser.FixedWidthFields = l.fixedWidthFields("PARSER_FIXED_WIDTH_FIELDS")
-	normalizeParser(&cfg.Parser)
+	cfg.Parser = loadParserConfig(&l, cfg.Input.SkipEmptyLine)
 
 	cfg.DB.Driver = normalizeDriver(l.stringValue("DB_DRIVER", ""))
 	cfg.DB.DSN = l.rawString("DB_DSN", "")
@@ -167,13 +107,114 @@ func Load(lookup LookupFunc) (JobConfig, error) {
 	return cfg, nil
 }
 
+func loadParserConfig(l *envLoader, skipEmptyLine bool) ParserConfig {
+	cfg := ParserConfig{
+		FixedWidthUnit: "BYTE",
+		JSONMode:       JSONModeAuto,
+		DateFormat:     "2006-01-02",
+		DateTimeFormat: time.RFC3339,
+		Timezone:       "UTC",
+		DefaultValues:  make(map[string]string),
+		MaxRecordBytes: defaultMaxRecordBytes,
+		MaxFields:      defaultMaxFields,
+		SkipEmptyLine:  skipEmptyLine,
+		Sectioned: SectionedDelimitedConfig{
+			RecordTypeIndex:       0,
+			SectionKeyIndex:       1,
+			HeaderStartIndex:      2,
+			DataStartIndex:        2,
+			DuplicateHeaderPolicy: DuplicateHeaderError,
+		},
+	}
+
+	cfg.FileType = FileType(strings.ToUpper(l.stringValue("PARSER_FILE_TYPE", "")))
+	cfg.Delimiter = l.delimiter("PARSER_DELIMITER")
+	cfg.HasHeader = l.boolValue("PARSER_HAS_HEADER", false)
+	cfg.FixedWidthUnit = strings.ToUpper(l.stringValue("PARSER_FIXED_WIDTH_UNIT", cfg.FixedWidthUnit))
+	cfg.JSONMode = JSONMode(strings.ToUpper(l.stringValue("PARSER_JSON_MODE", string(cfg.JSONMode))))
+	cfg.JSONRecordPath = l.stringValue("PARSER_JSON_RECORD_PATH", "")
+	cfg.XMLRecordPath = l.stringValue("PARSER_XML_RECORD_PATH", "")
+	cfg.DateFormat = l.stringValue("PARSER_DATE_FORMAT", cfg.DateFormat)
+	cfg.DateTimeFormat = l.stringValue("PARSER_DATETIME_FORMAT", cfg.DateTimeFormat)
+	cfg.Timezone = l.stringValue("PARSER_TIMEZONE", cfg.Timezone)
+	cfg.TrimSpace = l.boolValue("PARSER_TRIM_SPACE", false)
+	cfg.NullIfEmpty = l.boolValue("PARSER_NULL_IF_EMPTY", false)
+	cfg.AllowExtraColumns = l.boolValue("PARSER_ALLOW_EXTRA_COLUMNS", false)
+	cfg.MaxRecordBytes = l.intValue("PARSER_MAX_RECORD_BYTES", cfg.MaxRecordBytes)
+	cfg.MaxFields = l.intValue("PARSER_MAX_FIELDS", cfg.MaxFields)
+	cfg.Sectioned.RecordTypeIndex = l.intValue("PARSER_RECORD_TYPE_INDEX", cfg.Sectioned.RecordTypeIndex)
+	cfg.Sectioned.SectionKeyIndex = l.intValue("PARSER_SECTION_KEY_INDEX", cfg.Sectioned.SectionKeyIndex)
+	cfg.Sectioned.FileHeaderCode = l.stringValue("PARSER_FILE_HEADER_CODE", cfg.Sectioned.FileHeaderCode)
+	cfg.Sectioned.SectionHeaderCode = l.stringValue("PARSER_SECTION_HEADER_CODE", cfg.Sectioned.SectionHeaderCode)
+	cfg.Sectioned.DataCode = l.stringValue("PARSER_DATA_CODE", cfg.Sectioned.DataCode)
+	cfg.Sectioned.SectionFooterCode = l.stringValue("PARSER_SECTION_FOOTER_CODE", cfg.Sectioned.SectionFooterCode)
+	cfg.Sectioned.FileFooterCode = l.stringValue("PARSER_FILE_FOOTER_CODE", cfg.Sectioned.FileFooterCode)
+	cfg.Sectioned.HeaderStartIndex = l.intValue("PARSER_DYNAMIC_HEADER_START_INDEX", cfg.Sectioned.HeaderStartIndex)
+	cfg.Sectioned.DataStartIndex = l.intValue("PARSER_DATA_START_INDEX", cfg.Sectioned.DataStartIndex)
+	cfg.Sectioned.DuplicateHeaderPolicy = DuplicateHeaderPolicy(strings.ToUpper(l.stringValue("PARSER_DUPLICATE_HEADER_POLICY", string(cfg.Sectioned.DuplicateHeaderPolicy))))
+	cfg.UppercaseFields = l.list("PARSER_UPPERCASE_FIELDS")
+	cfg.LowercaseFields = l.list("PARSER_LOWERCASE_FIELDS")
+	cfg.RequiredFields = l.list("PARSER_REQUIRED_FIELDS")
+	cfg.DefaultValues = l.stringMap("PARSER_DEFAULT_VALUES")
+	cfg.Transforms = l.transforms()
+
+	columnNames := l.list("PARSER_COLUMNS")
+	columnTypes := l.dataTypes("PARSER_TYPES")
+	if len(columnNames) != len(columnTypes) && (len(columnNames) > 0 || len(columnTypes) > 0) {
+		l.problem("PARSER_COLUMNS and PARSER_TYPES must contain the same number of entries")
+	}
+	for index, name := range columnNames {
+		dataType := DataType("")
+		if index < len(columnTypes) {
+			dataType = columnTypes[index]
+		}
+		cfg.Columns = append(cfg.Columns, ColumnSpec{Name: name, Type: dataType})
+	}
+
+	genericMappings, genericSet := l.mappings("PARSER_MAPPING")
+	jsonMappings, jsonSet := l.mappings("PARSER_JSON_MAPPING")
+	xmlMappings, xmlSet := l.mappings("PARSER_XML_MAPPING")
+	switch cfg.FileType {
+	case FileTypeJSON:
+		if jsonSet {
+			cfg.Mappings = jsonMappings
+		} else {
+			cfg.Mappings = genericMappings
+		}
+	case FileTypeXML:
+		if xmlSet {
+			cfg.Mappings = xmlMappings
+		} else {
+			cfg.Mappings = genericMappings
+		}
+	default:
+		cfg.Mappings = genericMappings
+		if jsonSet {
+			l.problem("PARSER_JSON_MAPPING is only valid when PARSER_FILE_TYPE=JSON")
+		}
+		if xmlSet {
+			l.problem("PARSER_XML_MAPPING is only valid when PARSER_FILE_TYPE=XML")
+		}
+	}
+	if genericSet && jsonSet && cfg.FileType == FileTypeJSON {
+		l.problem("set only one of PARSER_MAPPING and PARSER_JSON_MAPPING for JSON input")
+	}
+	if genericSet && xmlSet && cfg.FileType == FileTypeXML {
+		l.problem("set only one of PARSER_MAPPING and PARSER_XML_MAPPING for XML input")
+	}
+
+	cfg.FixedWidthFields = l.fixedWidthFields("PARSER_FIXED_WIDTH_FIELDS")
+	normalizeParser(&cfg)
+	return cfg
+}
+
 type envLoader struct {
 	lookup   LookupFunc
 	problems []string
 }
 
 func (l *envLoader) problem(message string) {
-	l.problems = append(l.problems, message)
+	l.problems = appendConfigProblem(l.problems, message)
 }
 
 func (l *envLoader) rawString(key, fallback string) string {
@@ -486,7 +527,7 @@ func normalizeParser(parser *ParserConfig) {
 			if len(parser.Columns) == 1 {
 				parser.Mappings = []FieldMapping{{Source: "raw", Target: parser.Columns[0].Name}}
 			}
-		case FileTypeJSON, FileTypeXML:
+		case FileTypeJSON, FileTypeXML, FileTypeSectionedDelimited:
 			for _, column := range parser.Columns {
 				parser.Mappings = append(parser.Mappings, FieldMapping{Source: column.Name, Target: column.Name})
 			}

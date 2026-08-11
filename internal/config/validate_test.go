@@ -1,9 +1,12 @@
 package config
 
 import (
+	"errors"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 )
 
 func TestValidateAcceptsSupportedDrivers(t *testing.T) {
@@ -217,6 +220,47 @@ func TestValidateRejectsOverflowingFixedWidthRange(t *testing.T) {
 	}
 }
 
+func TestValidateRejectsExcessiveOrderedTransforms(t *testing.T) {
+	cfg := validJobConfig()
+	cfg.Parser.Transforms = make([]TransformRule, maxApplicationTransforms+1)
+	for index := range cfg.Parser.Transforms {
+		cfg.Parser.Transforms[index] = TransformRule{Field: "raw", Operation: TransformTrim}
+	}
+	err := Validate(cfg)
+	if err == nil || !strings.Contains(err.Error(), "must not contain more than") {
+		t.Fatalf("Validate() error = %v", err)
+	}
+}
+
+func TestValidateFixedWidthOverlapCheckScalesWithLargeConfiguration(t *testing.T) {
+	const count = 100_000
+	fields := make([]FixedWidthField, count)
+	for index := range fields {
+		fields[index] = FixedWidthField{
+			Name:   "field_" + strconv.Itoa(index),
+			Start:  index * 2,
+			Length: 1,
+			Type:   TypeString,
+		}
+	}
+	parser := ParserConfig{
+		FileType:         FileTypeFixedWidth,
+		FixedWidthUnit:   "BYTE",
+		FixedWidthFields: fields,
+		MaxRecordBytes:   maxApplicationRecordSize,
+		MaxFields:        1,
+	}
+	var problems []string
+	validateFormatSpecific(parser, map[DataType]bool{TypeString: true}, func(format string, args ...any) {
+		problems = append(problems, format)
+	})
+	for _, problem := range problems {
+		if strings.Contains(problem, "overlap") {
+			t.Fatalf("non-overlapping large config reported overlap: %s", problem)
+		}
+	}
+}
+
 func TestValidateFormatSpecificRules(t *testing.T) {
 	tests := []struct {
 		name string
@@ -255,6 +299,53 @@ func TestConfigErrorDeduplicatesAndSortsCopy(t *testing.T) {
 	sorted[0] = "mutated"
 	if err.Problems[0] != "z problem" {
 		t.Fatal("SortedProblems returned internal storage")
+	}
+}
+
+func TestConfigDiagnosticsBoundUntrustedNamesAndProblemCount(t *testing.T) {
+	longName := strings.Repeat("界", maxConfigLabelBytes)
+	fields := make([]FixedWidthField, maxConfigProblems*3)
+	for index := range fields {
+		fields[index] = FixedWidthField{
+			Name:   longName + strconv.Itoa(index),
+			Start:  0,
+			Length: 1,
+			Type:   TypeString,
+		}
+	}
+	parser := validJobConfig().Parser
+	parser.FileType = FileTypeFixedWidth
+	parser.FixedWidthFields = fields
+	parser.Columns = nil
+	parser.Mappings = nil
+
+	err := ValidateParser(parser)
+	var configErr *ConfigError
+	if !errors.As(err, &configErr) {
+		t.Fatalf("ValidateParser() error = %v", err)
+	}
+	if len(configErr.Problems) > maxConfigProblems+1 {
+		t.Fatalf("problem count = %d", len(configErr.Problems))
+	}
+	if len(err.Error()) > (maxConfigProblems+1)*(maxConfigProblemBytes+4) {
+		t.Fatalf("diagnostic unexpectedly large: %d bytes", len(err.Error()))
+	}
+	if strings.Contains(err.Error(), longName) {
+		t.Fatal("diagnostic contains an unbounded attacker-controlled label")
+	}
+	if got := configErr.Problems[len(configErr.Problems)-1]; got != omittedConfigProblems {
+		t.Fatalf("last problem = %q", got)
+	}
+}
+
+func TestConfigLabelTruncatesAtUTF8Boundary(t *testing.T) {
+	value := strings.Repeat("界", maxConfigLabelBytes)
+	got := configLabel(value)
+	if !utf8.ValidString(got) || !strings.HasSuffix(got, "...[truncated]") {
+		t.Fatalf("configLabel() = %q", got)
+	}
+	if got := configLabel("bad\xffname"); got != "[invalid UTF-8]" {
+		t.Fatalf("invalid UTF-8 configLabel() = %q", got)
 	}
 }
 

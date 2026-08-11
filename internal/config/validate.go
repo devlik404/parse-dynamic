@@ -15,7 +15,13 @@ const (
 	maxApplicationBatchBytes = 128 * 1024 * 1024
 	maxApplicationRecordSize = 8 * 1024 * 1024
 	maxApplicationFields     = 100_000
+	maxApplicationTransforms = 256
+	maxConfigProblems        = 128
+	maxConfigProblemBytes    = 1024
+	maxConfigLabelBytes      = 128
 )
+
+const omittedConfigProblems = "additional configuration problems were omitted"
 
 // ConfigError contains every discovered configuration problem so operators can
 // fix an ENV deployment in one pass. Values (and therefore secrets) are never
@@ -42,9 +48,30 @@ func newConfigError(problems []string) *ConfigError {
 			continue
 		}
 		seen[problem] = struct{}{}
-		unique = append(unique, problem)
+		unique = appendConfigProblem(unique, problem)
 	}
 	return &ConfigError{Problems: unique}
+}
+
+func appendConfigProblem(problems []string, problem string) []string {
+	if len(problem) > maxConfigProblemBytes {
+		end := maxConfigProblemBytes
+		for end > 0 && !utf8.RuneStart(problem[end]) {
+			end--
+		}
+		problem = problem[:end] + "...[truncated]"
+	}
+	if len(problems) < maxConfigProblems {
+		return append(problems, problem)
+	}
+	if len(problems) == maxConfigProblems || problems[len(problems)-1] != omittedConfigProblems {
+		return append(problems[:maxConfigProblems], omittedConfigProblems)
+	}
+	return problems
+}
+
+func configProblemLimitReached(problems []string) bool {
+	return len(problems) > maxConfigProblems && problems[len(problems)-1] == omittedConfigProblems
 }
 
 // Validate verifies a programmatically-created configuration using the same
@@ -57,10 +84,24 @@ func Validate(cfg JobConfig) error {
 	return newConfigError(problems)
 }
 
+// ValidateParser validates a parser-only configuration without requiring
+// filesystem, database, or error-sink settings. This is used by preview APIs
+// that never persist records.
+func ValidateParser(cfg ParserConfig) error {
+	problems := validateParserProblems(cfg)
+	if len(problems) == 0 {
+		return nil
+	}
+	return newConfigError(problems)
+}
+
 func validateProblems(cfg JobConfig) []string {
 	var problems []string
 	add := func(format string, args ...any) {
-		problems = append(problems, fmt.Sprintf(format, args...))
+		if configProblemLimitReached(problems) {
+			return
+		}
+		problems = appendConfigProblem(problems, fmt.Sprintf(format, args...))
 	}
 
 	if strings.TrimSpace(cfg.Input.Path) == "" {
@@ -78,13 +119,37 @@ func validateProblems(cfg JobConfig) []string {
 		}
 	}
 
+	for _, problem := range validateParserProblems(cfg.Parser) {
+		problems = appendConfigProblem(problems, problem)
+	}
+	columnNames := make(map[string]struct{}, len(cfg.Parser.Columns))
+	for _, column := range cfg.Parser.Columns {
+		if strings.TrimSpace(column.Name) != "" {
+			columnNames[column.Name] = struct{}{}
+		}
+	}
+	validateDB(cfg, columnNames, add)
+	validateError(cfg.Error, add)
+
+	return problems
+}
+
+func validateParserProblems(parser ParserConfig) []string {
+	var problems []string
+	add := func(format string, args ...any) {
+		if configProblemLimitReached(problems) {
+			return
+		}
+		problems = appendConfigProblem(problems, fmt.Sprintf(format, args...))
+	}
+
 	validFileTypes := map[FileType]bool{
 		FileTypeDelimited: true, FileTypeCSV: true, FileTypeTSV: true,
 		FileTypeFixedWidth: true, FileTypeJSON: true, FileTypeXML: true,
-		FileTypeRaw: true,
+		FileTypeRaw: true, FileTypeSectionedDelimited: true,
 	}
-	if !validFileTypes[cfg.Parser.FileType] {
-		add("PARSER_FILE_TYPE must be one of DELIMITED, CSV, TSV, FIXED_WIDTH, JSON, XML, RAW")
+	if !validFileTypes[parser.FileType] {
+		add("PARSER_FILE_TYPE must be one of DELIMITED, CSV, TSV, FIXED_WIDTH, JSON, XML, RAW, SECTIONED_DELIMITED")
 	}
 
 	validTypes := map[DataType]bool{
@@ -92,12 +157,12 @@ func validateProblems(cfg JobConfig) []string {
 		TypeFloat: true, TypeBoolean: true, TypeDate: true, TypeDateTime: true,
 		TypeUUID: true, TypeJSON: true,
 	}
-	columnNames := make(map[string]struct{}, len(cfg.Parser.Columns))
-	for index, column := range cfg.Parser.Columns {
+	columnNames := make(map[string]struct{}, len(parser.Columns))
+	for index, column := range parser.Columns {
 		if strings.TrimSpace(column.Name) == "" {
 			add("PARSER_COLUMNS entry %d must not be empty", index+1)
 		} else if _, exists := columnNames[column.Name]; exists {
-			add("PARSER_COLUMNS contains duplicate field %q", column.Name)
+			add("PARSER_COLUMNS contains duplicate field %q", configLabel(column.Name))
 		} else {
 			columnNames[column.Name] = struct{}{}
 		}
@@ -105,25 +170,22 @@ func validateProblems(cfg JobConfig) []string {
 			add("PARSER_TYPES entry %d must be one of string, integer, int64, decimal, float, boolean, date, datetime, uuid, json (any is reserved for inferred fields)", index+1)
 		}
 	}
-	if len(cfg.Parser.Columns) == 0 && validFileTypes[cfg.Parser.FileType] {
+	if len(parser.Columns) == 0 && validFileTypes[parser.FileType] {
 		add("PARSER_COLUMNS (or a format mapping from which columns can be inferred) is required")
 	}
 
-	validateDelimiter(cfg.Parser, add)
-	validateFormatSpecific(cfg.Parser, validTypes, add)
-	validateMappings(cfg.Parser, columnNames, add)
-	validateParserOptions(cfg.Parser, columnNames, add)
-	validateDB(cfg, columnNames, add)
-	validateError(cfg.Error, add)
-
+	validateDelimiter(parser, add)
+	validateFormatSpecific(parser, validTypes, add)
+	validateMappings(parser, columnNames, add)
+	validateParserOptions(parser, columnNames, add)
 	return problems
 }
 
 func validateDelimiter(parser ParserConfig, add func(string, ...any)) {
 	switch parser.FileType {
-	case FileTypeDelimited:
+	case FileTypeDelimited, FileTypeSectionedDelimited:
 		if parser.Delimiter == "" {
-			add("PARSER_DELIMITER is required when PARSER_FILE_TYPE=DELIMITED")
+			add("PARSER_DELIMITER is required when PARSER_FILE_TYPE=DELIMITED or SECTIONED_DELIMITED")
 		}
 	case FileTypeCSV:
 		if parser.Delimiter != "," {
@@ -143,7 +205,7 @@ func validateDelimiter(parser ParserConfig, add func(string, ...any)) {
 		add("PARSER_DELIMITER must contain valid UTF-8")
 		return
 	}
-	if parser.FileType != FileTypeDelimited && utf8.RuneCountInString(parser.Delimiter) != 1 {
+	if parser.FileType != FileTypeDelimited && parser.FileType != FileTypeSectionedDelimited && utf8.RuneCountInString(parser.Delimiter) != 1 {
 		add("PARSER_DELIMITER must be exactly one valid UTF-8 character for CSV or TSV")
 		return
 	}
@@ -165,7 +227,7 @@ func validateFormatSpecific(parser ParserConfig, validTypes map[DataType]bool, a
 			if field.Name == "" {
 				add("PARSER_FIXED_WIDTH_FIELDS entry %d name must not be empty", index+1)
 			} else if _, exists := names[field.Name]; exists {
-				add("PARSER_FIXED_WIDTH_FIELDS contains duplicate field %q", field.Name)
+				add("PARSER_FIXED_WIDTH_FIELDS contains duplicate field %q", configLabel(field.Name))
 			} else {
 				names[field.Name] = struct{}{}
 			}
@@ -183,19 +245,35 @@ func validateFormatSpecific(parser ParserConfig, validTypes map[DataType]bool, a
 				add("PARSER_FIXED_WIDTH_FIELDS entry %d has unsupported type", index+1)
 			}
 		}
-		for left := 0; left < len(parser.FixedWidthFields); left++ {
-			leftField := parser.FixedWidthFields[left]
-			if !validFixedRange(leftField, parser.MaxRecordBytes) {
-				continue
+		type indexedFixedRange struct {
+			field FixedWidthField
+			index int
+		}
+		validRanges := make([]indexedFixedRange, 0, len(parser.FixedWidthFields))
+		for index, field := range parser.FixedWidthFields {
+			if validFixedRange(field, parser.MaxRecordBytes) {
+				validRanges = append(validRanges, indexedFixedRange{field: field, index: index})
 			}
-			for right := left + 1; right < len(parser.FixedWidthFields); right++ {
-				rightField := parser.FixedWidthFields[right]
-				if !validFixedRange(rightField, parser.MaxRecordBytes) {
-					continue
-				}
-				if intervalsOverlap(leftField.Start, leftField.Length, rightField.Start, rightField.Length) {
-					add("PARSER_FIXED_WIDTH_FIELDS entries %q and %q overlap", leftField.Name, rightField.Name)
-				}
+		}
+		sort.SliceStable(validRanges, func(left, right int) bool {
+			if validRanges[left].field.Start != validRanges[right].field.Start {
+				return validRanges[left].field.Start < validRanges[right].field.Start
+			}
+			if validRanges[left].field.Length != validRanges[right].field.Length {
+				return validRanges[left].field.Length > validRanges[right].field.Length
+			}
+			return validRanges[left].index < validRanges[right].index
+		})
+		maximumEnd := -1
+		maximumIndex := -1
+		for _, item := range validRanges {
+			if item.field.Start < maximumEnd {
+				add("PARSER_FIXED_WIDTH_FIELDS entries %d and %d overlap", maximumIndex+1, item.index+1)
+			}
+			end := item.field.Start + item.field.Length
+			if end > maximumEnd {
+				maximumEnd = end
+				maximumIndex = item.index
 			}
 		}
 	}
@@ -208,6 +286,78 @@ func validateFormatSpecific(parser ParserConfig, validTypes map[DataType]bool, a
 	}
 	if parser.FileType == FileTypeXML && strings.TrimSpace(parser.XMLRecordPath) == "" {
 		add("PARSER_XML_RECORD_PATH is required when PARSER_FILE_TYPE=XML")
+	}
+	if parser.FileType == FileTypeSectionedDelimited {
+		validateSectionedDelimited(parser, add)
+	}
+}
+
+func validateSectionedDelimited(parser ParserConfig, add func(string, ...any)) {
+	cfg := parser.Sectioned
+	indices := []struct {
+		key   string
+		value int
+	}{
+		{"PARSER_RECORD_TYPE_INDEX", cfg.RecordTypeIndex},
+		{"PARSER_SECTION_KEY_INDEX", cfg.SectionKeyIndex},
+		{"PARSER_DYNAMIC_HEADER_START_INDEX", cfg.HeaderStartIndex},
+		{"PARSER_DATA_START_INDEX", cfg.DataStartIndex},
+	}
+	for _, item := range indices {
+		if item.value < 0 {
+			add("%s must be zero or greater", item.key)
+		} else if parser.MaxFields > 0 && item.value >= parser.MaxFields {
+			add("%s must be less than PARSER_MAX_FIELDS", item.key)
+		}
+	}
+	if cfg.RecordTypeIndex == cfg.SectionKeyIndex {
+		add("PARSER_RECORD_TYPE_INDEX and PARSER_SECTION_KEY_INDEX must be different")
+	}
+	controlIndex := cfg.RecordTypeIndex
+	if cfg.SectionKeyIndex > controlIndex {
+		controlIndex = cfg.SectionKeyIndex
+	}
+	if cfg.HeaderStartIndex <= controlIndex {
+		add("PARSER_DYNAMIC_HEADER_START_INDEX must be after the record type and section key indexes")
+	}
+	if cfg.DataStartIndex <= controlIndex {
+		add("PARSER_DATA_START_INDEX must be after the record type and section key indexes")
+	}
+	if parser.HasHeader {
+		add("PARSER_HAS_HEADER must be false for SECTIONED_DELIMITED; headers are introduced by section-header records")
+	}
+
+	codes := []struct {
+		key      string
+		value    string
+		required bool
+	}{
+		{"PARSER_FILE_HEADER_CODE", cfg.FileHeaderCode, false},
+		{"PARSER_SECTION_HEADER_CODE", cfg.SectionHeaderCode, true},
+		{"PARSER_DATA_CODE", cfg.DataCode, true},
+		{"PARSER_SECTION_FOOTER_CODE", cfg.SectionFooterCode, false},
+		{"PARSER_FILE_FOOTER_CODE", cfg.FileFooterCode, false},
+	}
+	seen := make(map[string]string, len(codes))
+	for _, item := range codes {
+		value := strings.TrimSpace(item.value)
+		if value == "" {
+			if item.required {
+				add("%s is required for SECTIONED_DELIMITED", item.key)
+			}
+			continue
+		}
+		if strings.Contains(value, parser.Delimiter) || strings.ContainsAny(value, "\x00\r\n") {
+			add("%s must not contain the delimiter, NUL, CR, or LF", item.key)
+		}
+		if previous, duplicate := seen[value]; duplicate {
+			add("%s must differ from %s", item.key, previous)
+		} else {
+			seen[value] = item.key
+		}
+	}
+	if cfg.DuplicateHeaderPolicy != DuplicateHeaderError && cfg.DuplicateHeaderPolicy != DuplicateHeaderSuffixIndex {
+		add("PARSER_DUPLICATE_HEADER_POLICY must be ERROR or SUFFIX_INDEX")
 	}
 }
 
@@ -237,15 +387,15 @@ func validateMappings(parser ParserConfig, columns map[string]struct{}, add func
 			continue
 		}
 		if _, exists := sources[mapping.Source]; exists {
-			add("%s contains duplicate source %q", key, mapping.Source)
+			add("%s contains duplicate source %q", key, configLabel(mapping.Source))
 		}
 		sources[mapping.Source] = struct{}{}
 		if _, exists := targets[mapping.Target]; exists {
-			add("%s contains duplicate target %q", key, mapping.Target)
+			add("%s contains duplicate target %q", key, configLabel(mapping.Target))
 		}
 		targets[mapping.Target] = struct{}{}
 		if _, exists := columns[mapping.Target]; !exists {
-			add("%s target %q is not declared in PARSER_COLUMNS", key, mapping.Target)
+			add("%s target %q is not declared in PARSER_COLUMNS", key, configLabel(mapping.Target))
 		}
 
 		switch parser.FileType {
@@ -253,12 +403,12 @@ func validateMappings(parser ParserConfig, columns map[string]struct{}, add func
 			if !parser.HasHeader {
 				position, err := strconv.Atoi(mapping.Source)
 				if err != nil || position < 0 {
-					add("%s source %q must be a zero-based non-negative index when PARSER_HAS_HEADER=false", key, mapping.Source)
+					add("%s source %q must be a zero-based non-negative index when PARSER_HAS_HEADER=false", key, configLabel(mapping.Source))
 				}
 			}
 		case FileTypeFixedWidth:
 			if _, exists := fixedNames[mapping.Source]; !exists {
-				add("%s source %q is not declared in PARSER_FIXED_WIDTH_FIELDS", key, mapping.Source)
+				add("%s source %q is not declared in PARSER_FIXED_WIDTH_FIELDS", key, configLabel(mapping.Source))
 			}
 		case FileTypeRaw:
 			if mapping.Source != "raw" {
@@ -268,7 +418,7 @@ func validateMappings(parser ParserConfig, columns map[string]struct{}, add func
 	}
 	for column := range columns {
 		if _, exists := targets[column]; !exists {
-			add("%s does not map canonical field %q", key, column)
+			add("%s does not map canonical field %q", key, configLabel(column))
 		}
 	}
 }
@@ -307,11 +457,11 @@ func validateParserOptions(parser ParserConfig, columns map[string]struct{}, add
 		seen := make(map[string]struct{}, len(values))
 		for _, field := range values {
 			if _, duplicate := seen[field]; duplicate {
-				add("%s contains duplicate field %q", key, field)
+				add("%s contains duplicate field %q", key, configLabel(field))
 			}
 			seen[field] = struct{}{}
 			if _, exists := columns[field]; !exists {
-				add("%s references unknown canonical field %q", key, field)
+				add("%s references unknown canonical field %q", key, configLabel(field))
 			}
 		}
 	}
@@ -324,15 +474,15 @@ func validateParserOptions(parser ParserConfig, columns map[string]struct{}, add
 	}
 	for _, field := range parser.LowercaseFields {
 		if _, conflict := upper[field]; conflict {
-			add("field %q cannot appear in both PARSER_UPPERCASE_FIELDS and PARSER_LOWERCASE_FIELDS", field)
+			add("field %q cannot appear in both PARSER_UPPERCASE_FIELDS and PARSER_LOWERCASE_FIELDS", configLabel(field))
 		}
 	}
 	for field, value := range parser.DefaultValues {
 		if _, exists := columns[field]; !exists {
-			add("PARSER_DEFAULT_VALUES references unknown canonical field %q", field)
+			add("PARSER_DEFAULT_VALUES references unknown canonical field %q", configLabel(field))
 		}
 		if parser.MaxRecordBytes > 0 && len(value) > parser.MaxRecordBytes {
-			add("PARSER_DEFAULT_VALUES value for %q exceeds PARSER_MAX_RECORD_BYTES", field)
+			add("PARSER_DEFAULT_VALUES value for %q exceeds PARSER_MAX_RECORD_BYTES", configLabel(field))
 		}
 	}
 
@@ -341,9 +491,12 @@ func validateParserOptions(parser ParserConfig, columns map[string]struct{}, add
 		TransformReplace: true, TransformSubstring: true, TransformDefaultValue: true,
 		TransformNullIfEmpty: true,
 	}
+	if len(parser.Transforms) > maxApplicationTransforms {
+		add("PARSER_TRANSFORMS_JSON must not contain more than %d rules", maxApplicationTransforms)
+	}
 	for index, rule := range parser.Transforms {
 		if _, exists := columns[rule.Field]; !exists {
-			add("PARSER_TRANSFORMS_JSON entry %d references unknown canonical field %q", index+1, rule.Field)
+			add("PARSER_TRANSFORMS_JSON entry %d references unknown canonical field %q", index+1, configLabel(rule.Field))
 		}
 		if !validOperations[rule.Operation] {
 			add("PARSER_TRANSFORMS_JSON entry %d has unsupported operation", index+1)
@@ -414,10 +567,10 @@ func validateDB(cfg JobConfig, parserColumns map[string]struct{}, add func(strin
 	dbColumns := make(map[string]struct{}, len(db.Columns))
 	for _, column := range db.Columns {
 		if !safeIdentifier(column) {
-			add("DB_COLUMNS entry %q must be a safe SQL identifier", column)
+			add("DB_COLUMNS entry %q must be a safe SQL identifier", configLabel(column))
 		}
 		if _, duplicate := dbColumns[column]; duplicate {
-			add("DB_COLUMNS contains duplicate column %q", column)
+			add("DB_COLUMNS contains duplicate column %q", configLabel(column))
 		}
 		dbColumns[column] = struct{}{}
 	}
@@ -432,23 +585,23 @@ func validateDB(cfg JobConfig, parserColumns map[string]struct{}, add func(strin
 			continue
 		}
 		if _, exists := parserColumns[mapping.Source]; !exists {
-			add("DB_COLUMN_MAPPING source %q is not a canonical parser field", mapping.Source)
+			add("DB_COLUMN_MAPPING source %q is not a canonical parser field", configLabel(mapping.Source))
 		}
 		if _, exists := dbColumns[mapping.Target]; !exists {
-			add("DB_COLUMN_MAPPING target %q is not declared in DB_COLUMNS", mapping.Target)
+			add("DB_COLUMN_MAPPING target %q is not declared in DB_COLUMNS", configLabel(mapping.Target))
 		}
 		if _, duplicate := sources[mapping.Source]; duplicate {
-			add("DB_COLUMN_MAPPING contains duplicate source %q", mapping.Source)
+			add("DB_COLUMN_MAPPING contains duplicate source %q", configLabel(mapping.Source))
 		}
 		if _, duplicate := targets[mapping.Target]; duplicate {
-			add("DB_COLUMN_MAPPING contains duplicate target %q", mapping.Target)
+			add("DB_COLUMN_MAPPING contains duplicate target %q", configLabel(mapping.Target))
 		}
 		sources[mapping.Source] = struct{}{}
 		targets[mapping.Target] = struct{}{}
 	}
 	for column := range dbColumns {
 		if _, mapped := targets[column]; !mapped {
-			add("DB_COLUMN_MAPPING does not map DB column %q", column)
+			add("DB_COLUMN_MAPPING does not map DB column %q", configLabel(column))
 		}
 	}
 }
@@ -546,12 +699,22 @@ func safeIdentifier(value string) bool {
 	return true
 }
 
-func intervalsOverlap(leftStart, leftLength, rightStart, rightLength int) bool {
-	if leftStart > rightStart {
-		leftStart, rightStart = rightStart, leftStart
-		leftLength, rightLength = rightLength, leftLength
+// configLabel bounds attacker-controlled labels before they are interpolated
+// into diagnostics. Validation is also used by the preview API, so a malformed
+// configuration object must not be able to amplify a small error into a large
+// allocation or response.
+func configLabel(value string) string {
+	if !utf8.ValidString(value) {
+		return "[invalid UTF-8]"
 	}
-	return leftLength > rightStart-leftStart
+	if len(value) <= maxConfigLabelBytes {
+		return value
+	}
+	end := maxConfigLabelBytes
+	for end > 0 && !utf8.RuneStart(value[end]) {
+		end--
+	}
+	return value[:end] + "...[truncated]"
 }
 
 // SortedProblems is useful to callers that need stable structured diagnostics.

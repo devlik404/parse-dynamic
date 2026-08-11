@@ -13,6 +13,18 @@ const (
 	FileTypeJSON       FileType = "JSON"
 	FileTypeXML        FileType = "XML"
 	FileTypeRaw        FileType = "RAW"
+	// FileTypeSectionedDelimited decodes files whose control records introduce
+	// a section-specific header followed by one or more data records.
+	FileTypeSectionedDelimited FileType = "SECTIONED_DELIMITED"
+)
+
+// DuplicateHeaderPolicy controls how repeated dynamic column names in a
+// section header are represented in source values.
+type DuplicateHeaderPolicy string
+
+const (
+	DuplicateHeaderError       DuplicateHeaderPolicy = "ERROR"
+	DuplicateHeaderSuffixIndex DuplicateHeaderPolicy = "SUFFIX_INDEX"
 )
 
 type JSONMode string
@@ -99,6 +111,24 @@ type ParserConfig struct {
 	MaxFields         int
 	AllowExtraColumns bool
 	SkipEmptyLine     bool
+	Sectioned         SectionedDelimitedConfig
+}
+
+// SectionedDelimitedConfig describes record framing only. Record codes are
+// deliberately configuration data so the parser has no business-format
+// knowledge. Empty file-header/footer codes make those frames optional; the
+// section-header and data codes are required.
+type SectionedDelimitedConfig struct {
+	RecordTypeIndex       int
+	SectionKeyIndex       int
+	FileHeaderCode        string
+	SectionHeaderCode     string
+	DataCode              string
+	SectionFooterCode     string
+	FileFooterCode        string
+	HeaderStartIndex      int
+	DataStartIndex        int
+	DuplicateHeaderPolicy DuplicateHeaderPolicy
 }
 
 type ColumnSpec struct {

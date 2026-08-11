@@ -23,6 +23,7 @@ var decimalPattern = regexp.MustCompile(`^[+-]?(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+)(
 const (
 	defaultMaxRecordBytes = 1024 * 1024
 	hardMaxRecordBytes    = 8 * 1024 * 1024
+	transformWorkFactor   = int64(4)
 )
 
 type Engine struct {
@@ -113,7 +114,12 @@ func (e *Engine) Apply(input model.Record) (model.Record, *model.RecordError) {
 		return record, outputLimitError(record, "", nil)
 	}
 
+	var transformWork int64
 	for _, rule := range e.cfg.Transforms {
+		if !e.chargeTransformWork(&transformWork, rule, record.Fields[rule.Field]) {
+			return record, recordError(record, rule.Field, "TRANSFORM_WORK_LIMIT",
+				"ordered transformations exceed the per-record work limit", record.Fields[rule.Field], "transformation")
+		}
 		if recordErr := e.applyRule(&record, rule); recordErr != nil {
 			return record, recordErr
 		}
@@ -142,6 +148,24 @@ func (e *Engine) Apply(input model.Record) (model.Record, *model.RecordError) {
 		}
 	}
 	return record, nil
+}
+
+func (e *Engine) chargeTransformWork(used *int64, rule config.TransformRule, value any) bool {
+	text, ok := value.(string)
+	if !ok || used == nil {
+		return true
+	}
+	cost := int64(len(text))
+	switch strings.ToUpper(strings.TrimSpace(string(rule.Operation))) {
+	case "REPLACE", "UPPERCASE", "UPPER", "LOWERCASE", "LOWER", "SUBSTRING":
+		cost *= 2
+	}
+	limit := e.maxBytes * transformWorkFactor
+	if cost < 0 || cost > limit || *used > limit-cost {
+		return false
+	}
+	*used += cost
+	return true
 }
 
 func (e *Engine) applyRule(record *model.Record, rule config.TransformRule) *model.RecordError {

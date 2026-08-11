@@ -66,6 +66,8 @@ func New(cfg config.ParserConfig) (StreamParser, error) {
 		return &xmlParser{cfg: cfg, recordPath: path}, nil
 	case config.FileTypeRaw:
 		return &rawParser{cfg: cfg}, nil
+	case config.FileTypeSectionedDelimited:
+		return newSectionedDelimitedParser(cfg)
 	default:
 		return nil, fmt.Errorf("unsupported PARSER_FILE_TYPE %q", cfg.FileType)
 	}

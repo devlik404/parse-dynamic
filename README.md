@@ -12,6 +12,7 @@ Supported decoders:
 - `JSON`: single object, top-level array, NDJSON, and a simple nested record path
 - `XML`: streaming record path, nested child paths, and `@attribute` selectors
 - `RAW`: one logical record per line
+- `SECTIONED_DELIMITED`: dynamic section headers such as `RH/SH/SB/SF/RF`
 
 Binary/proprietary formats such as XLSX, PDF, Parquet, Avro, Protobuf, compressed, or encrypted
 input still require an appropriate decoder adapter. Their downstream mapping can then reuse this
@@ -24,6 +25,9 @@ ENV -> validated immutable JobConfig -> file discovery -> streaming decoder
     -> source mapping -> transformations/type conversion -> validation
     -> canonical record -> DB mapping -> transaction + batches -> database
                                    \-> structured rejected-record JSONL
+
+HTTP request -> validated MinIO path + filename -> existing MinIO HTTP gateway
+             -> streamed file -> immutable ENV parser -> bounded JSON preview (no database write)
 ```
 
 No parser contains business field, table, customer, or filename branches. See
@@ -32,9 +36,9 @@ No parser contains business field, table, customer, or filename branches. See
 ## Quick start
 
 1. Copy `.env.example` and provide the required values through your process manager, container,
-   Kubernetes ConfigMap/Secret, or shell environment. The job intentionally reads OS ENV once;
-   it does not hot-reload configuration during a file.
-2. Ensure the configured target table and columns already exist.
+   Kubernetes ConfigMap/Secret, or shell environment. For local runs, `.env` is loaded automatically;
+   existing OS/Kubernetes variables take precedence. Configuration is not hot-reloaded during a run.
+2. In `APP_MODE=JOB`, ensure the configured target table and columns already exist.
 3. Run:
 
 ```bash
@@ -54,13 +58,74 @@ docker run --rm --env-file .env \
 On success the command prints a JSON summary. Any configuration, structural input, I/O, error
 sink, or database failure exits non-zero.
 
+### Parsing endpoint using the existing MinIO gateway
+
+Run the same binary as a read-only HTTP parser by setting `APP_MODE=HTTP`. This mode follows the
+connection contract used by `cashrecon-sch-parse-file-atm-bersama`: the service receives
+`final_minio_path` and `final_file_name`, then streams one object from
+`GET {MINIO_BASE_URL}/{MINIO_BUCKET_NAME}/{path}/{filename}`. It does not require MinIO/S3 SDK
+credentials and does not write a temporary local copy.
+
+```dotenv
+APP_MODE=HTTP
+HTTP_ADDR=:8080
+MINIO_BASE_URL=http://sch-minio.reopsc:8080
+MINIO_BUCKET_NAME=rsp-reopsc
+MINIO_HTTP_TIMEOUT=5m
+# Optional server-side restriction for final_minio_path.
+MINIO_PATH_PREFIX=
+PREVIEW_REQUIRE_AUTH=true
+PREVIEW_BEARER_TOKEN=<generate-a-random-token-of-at-least-32-bytes>
+PREVIEW_MAX_INPUT_BYTES=67108864
+PREVIEW_REQUEST_TIMEOUT=30s
+PREVIEW_MAX_CONCURRENCY=4
+```
+
+Set the parser variables in the same process ENV. A ready-to-use example for the dynamic
+`RH/SH/SB/SF/RF` format is available at
+[examples/cashrecon-sch-parse-file-atm-bersama.env](examples/cashrecon-sch-parse-file-atm-bersama.env).
+Then call the reference-compatible route:
+
+```bash
+curl --fail-with-body \
+  -H "Authorization: Bearer ${PREVIEW_BEARER_TOKEN}" \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "la_num": 123,
+    "final_minio_path": "reconciliation/atm-bersama/20260702",
+    "final_file_name": "report-20260702.txt",
+    "product_id": "ATM_BERSAMA",
+    "task": "PARSE_FILE",
+    "activity": "RECONCILIATION",
+    "file_date": "20260702",
+    "limit": 20
+  }' \
+  http://localhost:8080/parse-file-dyanmic
+```
+
+Only `final_minio_path` and `final_file_name` select the object; the scheduler metadata is accepted
+for request compatibility but does not alter parsing. `limit` controls the preview size. Parser
+configuration is loaded and validated once from ENV at startup, so callers cannot switch schemas.
+`MINIO_PATH_PREFIX`, when non-empty, restricts accessible object paths. The endpoint returns parsed
+records and recoverable errors, enforces input/request/value/response/time/concurrency limits, and
+never inserts into the database.
+
+Treat this endpoint as an internal service because preview output can contain financial data. Keep
+the Kubernetes Service as `ClusterIP`, terminate TLS at a trusted internal gateway, and source the
+optional `PREVIEW_BEARER_TOKEN` from a secret manager. Set `PREVIEW_REQUIRE_AUTH=false` only when an
+equivalent trusted gateway enforces authentication. The example
+[NetworkPolicy](deploy/kubernetes-api.yaml) accepts traffic only from same-namespace pods labeled
+`access-universal-parser-api=true`; adapt the selector if the gateway runs in another namespace.
+`GET /healthz` is an unauthenticated process-liveness check only. The manifest uses a TCP readiness
+probe because it intentionally does not fetch a business file merely to test gateway readiness.
+
 ## Core configuration
 
 | ENV | Meaning |
 |---|---|
 | `INPUT_PATH` | One regular file or a directory; symlinks are rejected |
 | `FILE_PATTERN` | Basename-only glob applied inside `INPUT_PATH` |
-| `PARSER_FILE_TYPE` | `DELIMITED`, `CSV`, `TSV`, `FIXED_WIDTH`, `JSON`, `XML`, or `RAW` |
+| `PARSER_FILE_TYPE` | `DELIMITED`, `CSV`, `TSV`, `FIXED_WIDTH`, `JSON`, `XML`, `RAW`, or `SECTIONED_DELIMITED` |
 | `PARSER_COLUMNS` / `PARSER_TYPES` | Ordered canonical schema and configured data types |
 | `PARSER_MAPPING` | Source selector to canonical field |
 | `PARSER_MAX_RECORD_BYTES` | Hard byte limit for one logical record (default 1 MiB) |
@@ -113,6 +178,35 @@ PARSER_MAPPING=id:transaction_id,date:transaction_date,bank:bank,amount:amount
 ```
 
 The header is validated before the first record is yielded or inserted.
+
+### Dynamic headers per section
+
+`SECTIONED_DELIMITED` handles a file where each section declares its own header. It is generic:
+the control codes, indexes, and duplicate-name policy all come from configuration.
+
+```dotenv
+PARSER_FILE_TYPE=SECTIONED_DELIMITED
+PARSER_DELIMITER=|
+PARSER_COLUMNS=record_type,section_key,payload
+PARSER_TYPES=string,string,json
+PARSER_MAPPING=record_type:record_type,section_key:section_key,payload:payload
+PARSER_RECORD_TYPE_INDEX=0
+PARSER_SECTION_KEY_INDEX=1
+PARSER_FILE_HEADER_CODE=RH
+PARSER_SECTION_HEADER_CODE=SH
+PARSER_DATA_CODE=SB
+PARSER_SECTION_FOOTER_CODE=SF
+PARSER_FILE_FOOTER_CODE=RF
+PARSER_DYNAMIC_HEADER_START_INDEX=2
+PARSER_DATA_START_INDEX=2
+PARSER_DUPLICATE_HEADER_POLICY=SUFFIX_INDEX
+```
+
+Only data records are yielded. Every `SH` supplies the field names for its following `SB`
+records. Dynamic fields are returned under `payload` and are also available as flattened source
+selectors. Repeated header names receive deterministic suffixes such as `TRF_TRX_BNF__2` when
+`SUFFIX_INDEX` is selected. Structural control-record errors remain fatal; safely framed invalid
+data rows are returned as structured record errors.
 
 ### Fixed width
 
@@ -193,7 +287,7 @@ go vet ./...
 go build ./cmd/app
 ```
 
-The tests cover all seven formats, reordered headers, quoted/multiline CSV, JSON modes and streaming
+The tests cover all eight formats, reordered headers, quoted/multiline CSV, JSON modes and streaming
 paths, XML records, fixed-width boundaries, mappings, transformations, types, batching, exact
 decimal/UUID SQL binding, SQL injection-resistant query construction, and STRICT/PARTIAL behavior.
 Repository tests exercise SQL construction, native pgx codecs, splitting, and transactional fakes;
@@ -204,6 +298,10 @@ Deployment examples:
 
 - [`Dockerfile`](Dockerfile)
 - [`deploy/kubernetes-job.yaml`](deploy/kubernetes-job.yaml)
+- [`deploy/kubernetes-api.yaml`](deploy/kubernetes-api.yaml)
 
 The older SQL-rule/FSM and HTTP packages remain in the repository as isolated legacy components.
-The production `cmd/app` entry point runs only the ENV-configured one-shot universal job.
+The production `cmd/app` entry point selects the one-shot job or MinIO-backed preview server with
+the strict `APP_MODE=JOB|HTTP` setting; parser behavior remains configuration-driven in both modes.
+For compatibility, legacy `MODE=HTTP` still starts the server and every other legacy `MODE` value
+(including `production`) continues to run the one-shot job. When present, `APP_MODE` takes precedence.

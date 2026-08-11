@@ -58,6 +58,7 @@ kind: ConfigMap
 metadata:
   name: universal-parser-config
 data:
+  APP_MODE: JOB
   INPUT_PATH: /data/input
   FILE_PATTERN: "*.txt"
   PARSER_FILE_TYPE: DELIMITED

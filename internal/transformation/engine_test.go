@@ -186,6 +186,25 @@ func TestReplaceExpansionIsRejectedBeforeAllocation(t *testing.T) {
 	}
 }
 
+func TestRepeatedTransformsStopAtCumulativeWorkLimit(t *testing.T) {
+	rules := make([]config.TransformRule, 3)
+	for index := range rules {
+		rules[index] = config.TransformRule{Field: "x", Operation: config.TransformReplace, From: "z", To: "q"}
+	}
+	engine, err := New(config.ParserConfig{MaxRecordBytes: 1024, Transforms: rules})
+	if err != nil {
+		t.Fatal(err)
+	}
+	value := strings.Repeat("a", 1000)
+	_, recordErr := engine.Apply(model.Record{Fields: map[string]any{"x": value}})
+	if recordErr == nil || recordErr.Code != "TRANSFORM_WORK_LIMIT" {
+		t.Fatalf("work-limit error = %#v", recordErr)
+	}
+	if strings.Contains(recordErr.Message, value) {
+		t.Fatal("work-limit message leaked the raw value")
+	}
+}
+
 func TestConversionExpansionHonorsCanonicalRecordLimit(t *testing.T) {
 	engine, err := New(config.ParserConfig{
 		FileType:       config.FileTypeJSON,
