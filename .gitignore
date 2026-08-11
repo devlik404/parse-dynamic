@@ -35,12 +35,18 @@ go.work.sum
 # Dependency cache
 # =====================
 vendor/
+.gocache/
+.gomodcache/
 
 # =====================
 # Logs
 # =====================
 *.log
 logs/
+*.jsonl
+input/
+errors/
+data/
 
 # =====================
 # OS files

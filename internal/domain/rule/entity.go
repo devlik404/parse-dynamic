@@ -11,7 +11,7 @@ dan digunakan secara immutable oleh engine.
 */
 
 type RuleVersion struct {
-	// Logical rule identifier (contoh: QR_REPORT_SENDER)
+	// Logical rule identifier supplied by the configured legacy rule source.
 	ID string
 
 	// Daftar section dalam file (urutan penting)

@@ -1,0 +1,16 @@
+.git
+.gitignore
+.env*
+!.env.example
+.gocache/
+.gomodcache/
+bin/
+build/
+dist/
+*.log
+*.jsonl
+coverage.out
+tmp/
+input/
+errors/
+data/

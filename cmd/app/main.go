@@ -1,72 +1,90 @@
 package main
 
 import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
 	"log"
-	"net/http"
+	"os"
+	"os/signal"
+	"syscall"
 
-	"parser-engine/internal/application/usecase"
-	"parser-engine/internal/domain/rule"
-	"parser-engine/internal/infrastructure/config"
-	"parser-engine/internal/infrastructure/emitter/sqlserver"
-	sqlserverinfra "parser-engine/internal/infrastructure/persistence/sqlserver"
-	httpiface "parser-engine/internal/interface/http"
-	"parser-engine/pkg/logger"
+	"parser-engine/internal/config"
+	"parser-engine/internal/repository"
+	"parser-engine/internal/repository/sqlrepo"
+	"parser-engine/internal/service"
 )
 
 func main() {
-	cfg, err := config.LoadConfig()
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	if err := run(ctx, os.Stdout); err != nil {
+		log.Printf("parser job failed: %v", err)
+		os.Exit(1)
+	}
+}
+
+func run(ctx context.Context, output io.Writer) error {
+	cfg, err := config.LoadFromEnv()
 	if err != nil {
-		log.Fatal(err)
+		return fmt.Errorf("configuration invalid: %w", err)
+	}
+	if _, err := service.DiscoverInputs(cfg); err != nil {
+		return fmt.Errorf("input preflight failed: %w", err)
 	}
 
-	logg := logger.InitLogger(logger.Level(cfg.LogLevel))
-	logg.Info("parser-engine starting")
-
-	// =====================================================
-	//  Connect DB ParamDynamic (RULE SOURCE)
-	// =====================================================
-	db, err := sqlserverinfra.NewConnection(sqlserverinfra.Config{
-		Host:     cfg.DB.Host,
-		Port:     cfg.DB.Port,
-		User:     cfg.DB.User,
-		Password: cfg.DB.Password,
-		Database: cfg.DB.Name,
-	})
+	errorSink, err := service.NewJSONErrorSink(cfg.Error.OutputPath)
 	if err != nil {
-		log.Fatal(err)
+		return err
 	}
-
-	// =====================================================
-	// Rule Repository (SQL Server ONLY)
-	// =====================================================
-	var ruleRepo rule.Repository
-	ruleRepo = sqlserverinfra.NewRuleRepository(db)
-
-	ruleSvc := rule.NewService()
-
-	loadRuleUC := usecase.NewLoadRuleUseCase(ruleRepo, ruleSvc)
-
-	recordEmitter := sqlserver.NewEmitter(db)
-
-	parseUC := &usecase.ParseFileUseCase{
-		LoadRuleUC:    loadRuleUC,
-		Emitter:       recordEmitter,
-		MaxErrorCount: cfg.MaxErrorCount,
-		SkipEmptyLine: cfg.SkipEmptyLine,
+	repo, err := sqlrepo.OpenContext(ctx, cfg.DB)
+	if err != nil {
+		return errors.Join(err, closeErrorSink(errorSink))
 	}
+	return runConfigured(ctx, output, cfg, repo, errorSink)
+}
 
-	// =====================================================
-	// Run Application (HTTP MODE)
-	// =====================================================
-	switch cfg.Mode {
-	case "http":
-		handler := httpiface.NewHandler(parseUC)
-		router := httpiface.NewRouter(handler)
-
-		logg.Info("HTTP server listening on :%s", cfg.HTTPPort)
-		log.Fatal(http.ListenAndServe(":"+cfg.HTTPPort, router))
-
-	default:
-		log.Fatalf("unsupported MODE: %s (only http allowed)", cfg.Mode)
+func runConfigured(ctx context.Context, output io.Writer, cfg config.JobConfig, repo repository.TransactionalRepository, errorSink service.ErrorSink) error {
+	runner, err := service.NewRunner(cfg, repo, errorSink)
+	if err != nil {
+		return errors.Join(err, closeRuntime(repo, errorSink))
 	}
+	summary, runErr := runner.Run(ctx)
+	closeErr := closeRuntime(repo, errorSink)
+	if closeErr != nil && runErr == nil {
+		// Records may already be committed at this point. Make that distinction
+		// explicit so an operator does not blindly retry a misleading SUCCESS.
+		summary.Status = "COMPLETED_WITH_CLOSE_ERROR"
+	}
+	encoder := json.NewEncoder(output)
+	encoder.SetIndent("", "  ")
+	if err := encoder.Encode(summary); err != nil {
+		return errors.Join(runErr, closeErr, fmt.Errorf("write job summary: %w", err))
+	}
+	return errors.Join(runErr, closeErr)
+}
+
+func closeRuntime(repo repository.TransactionalRepository, errorSink service.ErrorSink) error {
+	var result error
+	if errorSink != nil {
+		result = errors.Join(result, closeErrorSink(errorSink))
+	}
+	if repo != nil {
+		if err := repo.Close(); err != nil {
+			result = errors.Join(result, fmt.Errorf("close repository: %w", err))
+		}
+	}
+	return result
+}
+
+func closeErrorSink(errorSink service.ErrorSink) error {
+	if errorSink == nil {
+		return nil
+	}
+	if err := errorSink.Close(); err != nil {
+		return fmt.Errorf("close error sink: %w", err)
+	}
+	return nil
 }

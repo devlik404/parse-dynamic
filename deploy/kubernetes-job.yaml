@@ -1,0 +1,94 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: universal-parser-job
+spec:
+  # Automatic retries can replay files that were committed before a later file
+  # failed. Enable retries only after adding a workload-specific idempotency key.
+  backoffLimit: 0
+  template:
+    metadata:
+      labels:
+        app: universal-parser-job
+    spec:
+      restartPolicy: Never
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        fsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: parser
+          image: parser-job:v1.0.0
+          imagePullPolicy: IfNotPresent
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: "1"
+              memory: 512Mi
+          envFrom:
+            - configMapRef:
+                name: universal-parser-config
+            - secretRef:
+                name: universal-parser-secret
+          volumeMounts:
+            - name: input
+              mountPath: /data/input
+              readOnly: true
+            - name: errors
+              mountPath: /data/errors
+      volumes:
+        - name: input
+          persistentVolumeClaim:
+            claimName: parser-input
+        - name: errors
+          persistentVolumeClaim:
+            claimName: parser-errors
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: universal-parser-config
+data:
+  INPUT_PATH: /data/input
+  FILE_PATTERN: "*.txt"
+  PARSER_FILE_TYPE: DELIMITED
+  PARSER_DELIMITER: "|"
+  PARSER_HAS_HEADER: "false"
+  PARSER_COLUMNS: transaction_id,transaction_date,bank,amount
+  PARSER_TYPES: string,date,string,decimal
+  PARSER_MAPPING: 0:transaction_id,1:transaction_date,2:bank,3:amount
+  PARSER_DATE_FORMAT: "20060102"
+  PARSER_TRIM_SPACE: "true"
+  PARSER_MAX_RECORD_BYTES: "1048576"
+  PARSER_MAX_FIELDS: "10000"
+  DB_DRIVER: postgres
+  DB_HOST: postgres.default.svc
+  DB_PORT: "5432"
+  DB_NAME: reconciliation
+  DB_SCHEMA: public
+  DB_TABLE: transactions
+  DB_COLUMNS: transaction_id,transaction_date,bank,amount
+  DB_COLUMN_MAPPING: transaction_id:transaction_id,transaction_date:transaction_date,bank:bank,amount:amount
+  DB_BATCH_SIZE: "1000"
+  DB_BATCH_MAX_BYTES: "67108864"
+  DB_SSL_MODE: require
+  ERROR_MODE: PARTIAL
+  ERROR_OUTPUT_PATH: /data/errors/rejected-records.jsonl
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: universal-parser-secret
+type: Opaque
+stringData:
+  DB_USER: replace-me
+  DB_PASSWORD: replace-me
