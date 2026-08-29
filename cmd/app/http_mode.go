@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
+	"log/slog"
 	"net"
 	"net/http"
 	"os"
@@ -18,8 +20,9 @@ import (
 )
 
 const (
-	applicationModeJob  = "JOB"
-	applicationModeHTTP = "HTTP"
+	applicationModeJob       = "JOB"
+	applicationModeHTTP      = "HTTP"
+	applicationModeScheduler = "SCHEDULER"
 )
 
 type httpRuntimeConfig struct {
@@ -32,6 +35,8 @@ type httpRuntimeConfig struct {
 	WriteTimeout      time.Duration
 	IdleTimeout       time.Duration
 	ShutdownTimeout   time.Duration
+	LogLevel          slog.Level
+	LogFormat         string
 }
 
 func applicationMode(lookup config.LookupFunc) (string, error) {
@@ -41,10 +46,10 @@ func applicationMode(lookup config.LookupFunc) (string, error) {
 	if value, found := lookup("APP_MODE"); found {
 		mode := strings.ToUpper(strings.TrimSpace(value))
 		switch mode {
-		case applicationModeJob, applicationModeHTTP:
+		case applicationModeJob, applicationModeHTTP, applicationModeScheduler:
 			return mode, nil
 		default:
-			return "", fmt.Errorf("APP_MODE must be JOB or HTTP")
+			return "", fmt.Errorf("APP_MODE must be JOB, HTTP, or SCHEDULER")
 		}
 	}
 
@@ -90,6 +95,8 @@ func loadHTTPRuntimeConfig(lookup config.LookupFunc) (httpRuntimeConfig, error) 
 		WriteTimeout:      60 * time.Second,
 		IdleTimeout:       60 * time.Second,
 		ShutdownTimeout:   10 * time.Second,
+		LogLevel:          slog.LevelInfo,
+		LogFormat:         "text",
 	}
 
 	cfg.Address = l.stringValue("HTTP_ADDR", cfg.Address)
@@ -118,6 +125,11 @@ func loadHTTPRuntimeConfig(lookup config.LookupFunc) (httpRuntimeConfig, error) 
 	cfg.WriteTimeout = l.durationValue("HTTP_WRITE_TIMEOUT", cfg.WriteTimeout)
 	cfg.IdleTimeout = l.durationValue("HTTP_IDLE_TIMEOUT", cfg.IdleTimeout)
 	cfg.ShutdownTimeout = l.durationValue("HTTP_SHUTDOWN_TIMEOUT", cfg.ShutdownTimeout)
+	cfg.LogLevel = l.logLevel("LOG_LEVEL", cfg.LogLevel)
+	cfg.LogFormat = strings.ToLower(l.stringValue("LOG_FORMAT", cfg.LogFormat))
+	if cfg.LogFormat != "text" && cfg.LogFormat != "json" {
+		l.problem("LOG_FORMAT must be text or json")
+	}
 
 	parserConfig, parserErr := config.LoadParser(lookup)
 	if parserErr != nil {
@@ -188,20 +200,28 @@ func runHTTP(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("initialize MinIO gateway: %w", err)
 	}
+	logger := newHTTPLogger(cfg)
+	cfg.Preview.Logger = logger
 	handler, err := preview.NewHandler(source, cfg.Parser, cfg.Preview)
 	if err != nil {
 		return fmt.Errorf("initialize preview endpoint: %w", err)
 	}
 
+	listener, err := net.Listen("tcp", cfg.Address)
+	if err != nil {
+		return fmt.Errorf("listen for preview HTTP endpoint: %w", err)
+	}
 	server := newHTTPServer(ctx, cfg, handler)
 	serverErrors := make(chan error, 1)
 	go func() {
-		serverErrors <- server.ListenAndServe()
+		serverErrors <- server.Serve(listener)
 	}()
+	logger.InfoContext(ctx, "server_started", "address", cfg.Address, "route", preview.Route)
 
 	select {
 	case err := <-serverErrors:
 		if errors.Is(err, http.ErrServerClosed) {
+			logger.Info("server_stopped")
 			return nil
 		}
 		return fmt.Errorf("serve preview HTTP endpoint: %w", err)
@@ -217,8 +237,24 @@ func runHTTP(ctx context.Context) error {
 		if serveErr != nil && !errors.Is(serveErr, http.ErrServerClosed) {
 			return fmt.Errorf("serve preview HTTP endpoint: %w", serveErr)
 		}
+		logger.Info("server_stopped")
 		return nil
 	}
+}
+
+func newHTTPLogger(cfg httpRuntimeConfig) *slog.Logger {
+	return newHTTPLoggerTo(cfg, os.Stdout)
+}
+
+func newHTTPLoggerTo(cfg httpRuntimeConfig, output io.Writer) *slog.Logger {
+	opts := &slog.HandlerOptions{Level: cfg.LogLevel}
+	var handler slog.Handler
+	if cfg.LogFormat == "json" {
+		handler = slog.NewJSONHandler(output, opts)
+	} else {
+		handler = slog.NewTextHandler(output, opts)
+	}
+	return slog.New(handler).With("component", "parser_http")
 }
 
 func newHTTPServer(ctx context.Context, cfg httpRuntimeConfig, handler http.Handler) *http.Server {
@@ -305,6 +341,19 @@ func (l *httpEnvLoader) durationValue(key string, fallback time.Duration) time.D
 		return fallback
 	}
 	return parsed
+}
+
+func (l *httpEnvLoader) logLevel(key string, fallback slog.Level) slog.Level {
+	value, found := l.lookup(key)
+	if !found {
+		return fallback
+	}
+	var level slog.Level
+	if err := level.UnmarshalText([]byte(strings.ToLower(strings.TrimSpace(value)))); err != nil {
+		l.problem(key + " must be debug, info, warn, or error")
+		return fallback
+	}
+	return level
 }
 
 func uniqueStrings(values []string) []string {

@@ -11,6 +11,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"sort"
 	"strings"
 	"time"
@@ -49,6 +50,8 @@ const (
 	maxPreviewDepth           = 6
 	maxPreviewJSONBytes       = 256 * 1024
 	maxPreviewResponseRefSize = 256
+	progressByteInterval      = int64(1024 * 1024)
+	progressTimeInterval      = 5 * time.Second
 )
 
 // ObjectSource is the narrow interface implemented by miniogateway.Client.
@@ -56,6 +59,15 @@ const (
 // existing storage contract.
 type ObjectSource interface {
 	Open(ctx context.Context, minioPath, fileName string) (io.ReadCloser, error)
+}
+
+// MetadataObjectSource is implemented by gateways that support the same
+// HEAD/GET-with-offset contract as cashrecon-sch-parse-file-qris-tap. Keeping
+// it optional preserves compatibility with simple ObjectSource adapters.
+type MetadataObjectSource interface {
+	ObjectSource
+	StatObject(ctx context.Context, minioPath, fileName string) (miniogateway.ObjectMetadata, error)
+	OpenObject(ctx context.Context, minioPath, fileName string, offset int64) (io.ReadCloser, error)
 }
 
 // Options contains server-owned policy. The request can choose neither parser
@@ -78,6 +90,11 @@ type Options struct {
 	MaxValueBytes         int
 	RequestTimeout        time.Duration
 	MaxConcurrentRequests int
+
+	// Logger receives fixed-schema operational events. Request values, object
+	// paths, filenames, payloads, raw errors, and credentials are never logged.
+	// A nil logger disables preview logs, which keeps library callers quiet.
+	Logger *slog.Logger
 }
 
 // Request mirrors the scheduler payload used by cashrecon-sch-parse-file-atm-
@@ -133,6 +150,7 @@ type Service struct {
 	source ObjectSource
 	engine *parser.Engine
 	opts   Options
+	logger *slog.Logger
 }
 
 // NewService validates both the parser and all resource policy once at
@@ -155,7 +173,7 @@ func NewService(source ObjectSource, parserConfig config.ParserConfig, opts Opti
 	// Authentication material is consumed by NewHandler and must not remain in
 	// the long-lived service policy.
 	opts.BearerToken = ""
-	return &Service{source: source, engine: engine, opts: opts}, nil
+	return &Service{source: source, engine: engine, opts: opts, logger: opts.Logger}, nil
 }
 
 func cloneParserConfig(input config.ParserConfig) config.ParserConfig {
@@ -252,6 +270,7 @@ type errorKind string
 const (
 	errorInvalidRequest errorKind = "INVALID_REQUEST"
 	errorFileObject     errorKind = "FILE_OBJECT_ERROR"
+	errorObjectChanged  errorKind = "OBJECT_CHANGED"
 	errorInputTooLarge  errorKind = "INPUT_TOO_LARGE"
 	errorParse          errorKind = "PARSE_ERROR"
 	errorCanceled       errorKind = "REQUEST_CANCELED"
@@ -279,6 +298,7 @@ var errInputByteLimit = errors.New("input object exceeds the configured byte lim
 // Preview opens exactly one configured file and streams it through the parser.
 // It has no database dependency and cannot perform persistence.
 func (s *Service) Preview(ctx context.Context, req Request) (Response, error) {
+	startedAt := time.Now()
 	response := Response{
 		Status:  "ERROR",
 		Records: make([]PreviewRecord, 0),
@@ -314,25 +334,72 @@ func (s *Service) Preview(ctx context.Context, req Request) (Response, error) {
 	response.FinalFileName = sanitizeText(fileName, maxPreviewResponseRefSize)
 	response.Summary.RequestedLimit = limit
 
-	fileReader, err := s.source.Open(ctx, minioPath, fileName)
+	logger := requestLogger(ctx, s.logger)
+	var initialMetadata *miniogateway.ObjectMetadata
+	metadataSource, supportsMetadata := s.source.(MetadataObjectSource)
+	if supportsMetadata {
+		statStartedAt := time.Now()
+		logger.InfoContext(ctx, "minio_stat_started")
+		metadata, statErr := metadataSource.StatObject(ctx, minioPath, fileName)
+		if statErr != nil {
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				logger.WarnContext(ctx, "minio_stat_failed", "error_code", string(contextError(ctxErr).kind), "duration_ms", elapsedMilliseconds(statStartedAt))
+				return response, contextError(ctxErr)
+			}
+			logger.WarnContext(ctx, "minio_stat_failed", "error_code", string(errorFileObject), "duration_ms", elapsedMilliseconds(statStartedAt))
+			return response, &serviceError{kind: errorFileObject, message: "unable to read input file metadata from MinIO", cause: statErr}
+		}
+		if metadata.Size > s.opts.MaxInputBytes {
+			logger.WarnContext(ctx, "minio_stat_failed", "error_code", string(errorInputTooLarge), "duration_ms", elapsedMilliseconds(statStartedAt))
+			return response, &serviceError{kind: errorInputTooLarge, message: "input file exceeds the configured byte limit", cause: errInputByteLimit}
+		}
+		initialMetadata = &metadata
+		logger.InfoContext(ctx, "minio_metadata_loaded", "object_size", metadata.Size, "duration_ms", elapsedMilliseconds(statStartedAt))
+	}
+
+	logger.InfoContext(ctx, "minio_open_started")
+	openStartedAt := time.Now()
+	var fileReader io.ReadCloser
+	var err error
+	if supportsMetadata {
+		fileReader, err = metadataSource.OpenObject(ctx, minioPath, fileName, 0)
+	} else {
+		fileReader, err = s.source.Open(ctx, minioPath, fileName)
+	}
 	if err != nil {
 		if fileReader != nil {
 			_ = fileReader.Close()
 		}
 		if ctxErr := ctx.Err(); ctxErr != nil {
+			logger.WarnContext(ctx, "minio_open_failed", "error_code", string(contextError(ctxErr).kind), "duration_ms", elapsedMilliseconds(openStartedAt))
 			return response, contextError(ctxErr)
 		}
+		logger.WarnContext(ctx, "minio_open_failed", "error_code", string(errorFileObject), "duration_ms", elapsedMilliseconds(openStartedAt))
 		return response, &serviceError{kind: errorFileObject, message: "unable to open input file from MinIO", cause: err}
 	}
 	if fileReader == nil {
+		logger.WarnContext(ctx, "minio_open_failed", "error_code", string(errorFileObject), "duration_ms", elapsedMilliseconds(openStartedAt))
 		return response, &serviceError{kind: errorFileObject, message: "unable to open input file from MinIO"}
 	}
+	logger.InfoContext(ctx, "minio_stream_opened", "duration_ms", elapsedMilliseconds(openStartedAt))
 	limitedReader := &inputBoundedReadCloser{ReadCloser: fileReader, remaining: s.opts.MaxInputBytes}
 	trackedReader := &errorTrackingReadCloser{ReadCloser: limitedReader}
+	progress := &progressReadCloser{
+		ReadCloser: trackedReader,
+		logger:     logger,
+		startedAt:  startedAt,
+		lastAt:     startedAt,
+		ctx:        ctx,
+		nextBytes:  progressByteInterval,
+		results:    &response.Summary.Results,
+		records:    &response.Summary.Records,
+		errors:     &response.Summary.Errors,
+	}
 
 	usedBytes, _ := encodedSize(response)
 	usedBytes += 256
-	processErr := s.engine.Process(ctx, trackedReader, fileName, func(result parser.Result) error {
+	logger.InfoContext(ctx, "parsing_started", "limit", limit)
+	processErr := s.engine.Process(ctx, progress, fileName, func(result parser.Result) error {
 		if response.Summary.Results >= limit {
 			response.Summary.Truncated = true
 			return errPreviewComplete
@@ -368,15 +435,18 @@ func (s *Service) Preview(ctx context.Context, req Request) (Response, error) {
 		}
 		return nil
 	})
-	closeErr := trackedReader.Close()
+	closeErr := progress.Close()
 	if processErr != nil && !errors.Is(processErr, errPreviewComplete) {
 		if ctxErr := ctx.Err(); ctxErr != nil {
+			logParsingFinished(logger, ctx, "parsing_failed", response.Summary, progress.bytesRead, startedAt, contextError(ctxErr).kind)
 			return response, contextError(ctxErr)
 		}
 		if errors.Is(trackedReader.readErr, errInputByteLimit) || errors.Is(processErr, errInputByteLimit) {
+			logParsingFinished(logger, ctx, "parsing_failed", response.Summary, progress.bytesRead, startedAt, errorInputTooLarge)
 			return response, &serviceError{kind: errorInputTooLarge, message: "input file exceeds the configured byte limit", cause: errInputByteLimit}
 		}
 		if trackedReader.readErr != nil {
+			logParsingFinished(logger, ctx, "parsing_failed", response.Summary, progress.bytesRead, startedAt, errorFileObject)
 			return response, &serviceError{kind: errorFileObject, message: "unable to read input file from MinIO", cause: trackedReader.readErr}
 		}
 		response.Status = "ERROR"
@@ -384,10 +454,38 @@ func (s *Service) Preview(ctx context.Context, req Request) (Response, error) {
 			response.Status = "PARTIAL"
 		}
 		fitResponse(&response, s.opts.MaxResponseBytes)
+		logParsingFinished(logger, ctx, "parsing_failed", response.Summary, progress.bytesRead, startedAt, errorParse)
 		return response, &serviceError{kind: errorParse, message: "input file could not be parsed safely", cause: processErr}
 	}
 	if closeErr != nil {
+		logParsingFinished(logger, ctx, "parsing_failed", response.Summary, progress.bytesRead, startedAt, errorFileObject)
 		return response, &serviceError{kind: errorFileObject, message: "unable to close input file from MinIO", cause: closeErr}
+	}
+	if initialMetadata != nil && progress.bytesRead > initialMetadata.Size {
+		logger.WarnContext(ctx, "minio_verify_failed", "error_code", string(errorObjectChanged))
+		return response, &serviceError{kind: errorObjectChanged, message: "MinIO object changed while it was being read"}
+	}
+	if initialMetadata != nil && trackedReader.reachedEOF {
+		if progress.bytesRead != initialMetadata.Size {
+			logger.WarnContext(ctx, "minio_verify_failed", "error_code", string(errorObjectChanged))
+			return response, &serviceError{kind: errorObjectChanged, message: "MinIO object changed while it was being read"}
+		}
+		verifyStartedAt := time.Now()
+		logger.InfoContext(ctx, "minio_verify_started")
+		finalMetadata, statErr := metadataSource.StatObject(ctx, minioPath, fileName)
+		if statErr != nil {
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				logger.WarnContext(ctx, "minio_verify_failed", "error_code", string(contextError(ctxErr).kind), "duration_ms", elapsedMilliseconds(verifyStartedAt))
+				return response, contextError(ctxErr)
+			}
+			logger.WarnContext(ctx, "minio_verify_failed", "error_code", string(errorFileObject), "duration_ms", elapsedMilliseconds(verifyStartedAt))
+			return response, &serviceError{kind: errorFileObject, message: "unable to verify input file metadata from MinIO", cause: statErr}
+		}
+		if !initialMetadata.SameObject(finalMetadata) {
+			logger.WarnContext(ctx, "minio_verify_failed", "error_code", string(errorObjectChanged), "duration_ms", elapsedMilliseconds(verifyStartedAt))
+			return response, &serviceError{kind: errorObjectChanged, message: "MinIO object changed while it was being read"}
+		}
+		logger.InfoContext(ctx, "minio_object_verified", "duration_ms", elapsedMilliseconds(verifyStartedAt))
 	}
 
 	response.Status = "SUCCESS"
@@ -395,16 +493,86 @@ func (s *Service) Preview(ctx context.Context, req Request) (Response, error) {
 		response.Status = "PARTIAL"
 	}
 	fitResponse(&response, s.opts.MaxResponseBytes)
+	logParsingFinished(logger, ctx, "parsing_completed", response.Summary, progress.bytesRead, startedAt, "")
 	return response, nil
+}
+
+type progressReadCloser struct {
+	io.ReadCloser
+	logger    *slog.Logger
+	startedAt time.Time
+	lastAt    time.Time
+	ctx       context.Context
+	nextBytes int64
+	bytesRead int64
+	results   *int
+	records   *int
+	errors    *int
+}
+
+func (r *progressReadCloser) Read(buffer []byte) (int, error) {
+	count, err := r.ReadCloser.Read(buffer)
+	r.bytesRead += int64(count)
+	now := time.Now()
+	if r.bytesRead >= r.nextBytes || now.Sub(r.lastAt) >= progressTimeInterval {
+		r.logger.InfoContext(r.ctx, "parsing_progress",
+			"bytes_read", r.bytesRead,
+			"results", counterValue(r.results),
+			"records", counterValue(r.records),
+			"parse_errors", counterValue(r.errors),
+			"duration_ms", elapsedMilliseconds(r.startedAt),
+		)
+		r.lastAt = now
+		for r.nextBytes <= r.bytesRead {
+			r.nextBytes += progressByteInterval
+		}
+	}
+	return count, err
+}
+
+func counterValue(value *int) int {
+	if value == nil {
+		return 0
+	}
+	return *value
+}
+
+func logParsingFinished(logger *slog.Logger, ctx context.Context, event string, summary Summary, bytesRead int64, startedAt time.Time, code errorKind) {
+	attrs := []any{
+		"bytes_read", bytesRead,
+		"results", summary.Results,
+		"records", summary.Records,
+		"parse_errors", summary.Errors,
+		"truncated", summary.Truncated,
+		"duration_ms", elapsedMilliseconds(startedAt),
+	}
+	if code != "" {
+		attrs = append(attrs, "error_code", string(code))
+		logger.WarnContext(ctx, event, attrs...)
+		return
+	}
+	logger.InfoContext(ctx, event, attrs...)
+}
+
+func elapsedMilliseconds(startedAt time.Time) int64 {
+	value := time.Since(startedAt).Milliseconds()
+	if value < 0 {
+		return 0
+	}
+	return value
 }
 
 type errorTrackingReadCloser struct {
 	io.ReadCloser
-	readErr error
+	readErr    error
+	reachedEOF bool
 }
 
 func (r *errorTrackingReadCloser) Read(buffer []byte) (int, error) {
 	count, err := r.ReadCloser.Read(buffer)
+	if errors.Is(err, io.EOF) {
+		r.reachedEOF = true
+	}
 	if err != nil && !errors.Is(err, io.EOF) && r.readErr == nil {
 		r.readErr = err
 	}

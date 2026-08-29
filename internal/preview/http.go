@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"log/slog"
 	"mime"
 	"net/http"
 	"strings"
@@ -22,6 +23,7 @@ type Handler struct {
 	concurrencySlots chan struct{}
 	authEnabled      bool
 	bearerDigest     [sha256.Size]byte
+	logger           *slog.Logger
 }
 
 type APIError struct {
@@ -34,7 +36,7 @@ type errorResponse struct {
 	Error  APIError `json:"error"`
 }
 
-// NewHandler returns a router containing POST /parse-file-dyanmic and GET
+// NewHandler returns a router containing POST /parse-file-dynamic and GET
 // /healthz. Parser configuration is fixed at construction time.
 func NewHandler(source ObjectSource, parserConfig config.ParserConfig, opts Options) (http.Handler, error) {
 	if opts.RequireBearerAuth && opts.BearerToken == "" {
@@ -58,11 +60,63 @@ func NewHandler(source ObjectSource, parserConfig config.ParserConfig, opts Opti
 		concurrencySlots: make(chan struct{}, service.opts.MaxConcurrentRequests),
 		authEnabled:      authEnabled,
 		bearerDigest:     bearerDigest,
+		logger:           opts.Logger,
 	}
 	mux := http.NewServeMux()
 	mux.HandleFunc(Route, handler.preview)
 	mux.HandleFunc(HealthRoute, handler.health)
-	return mux, nil
+	return handler.withAccessLogging(mux), nil
+}
+
+type statusResponseWriter struct {
+	http.ResponseWriter
+	status int
+}
+
+func (writer *statusResponseWriter) WriteHeader(status int) {
+	if writer.status != 0 {
+		return
+	}
+	writer.status = status
+	writer.ResponseWriter.WriteHeader(status)
+}
+
+func (writer *statusResponseWriter) Write(data []byte) (int, error) {
+	if writer.status == 0 {
+		writer.WriteHeader(http.StatusOK)
+	}
+	return writer.ResponseWriter.Write(data)
+}
+
+func (writer *statusResponseWriter) Unwrap() http.ResponseWriter { return writer.ResponseWriter }
+
+func (h *Handler) withAccessLogging(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		if request.URL.Path == HealthRoute || h.logger == nil {
+			next.ServeHTTP(w, request)
+			return
+		}
+		startedAt := time.Now()
+		requestID := newRequestID()
+		logger := h.logger.With("request_id", requestID)
+		logger.InfoContext(request.Context(), "request_started", "method", request.Method, "route", Route)
+		w.Header().Set("X-Request-ID", requestID)
+		statusWriter := &statusResponseWriter{ResponseWriter: w}
+		request = request.WithContext(withRequestLogger(request.Context(), logger))
+		defer func() {
+			status := statusWriter.status
+			if status == 0 {
+				status = http.StatusOK
+			}
+			logger.InfoContext(request.Context(), "request_completed",
+				"method", request.Method,
+				"route", Route,
+				"http_status", status,
+				"duration_ms", elapsedMilliseconds(startedAt),
+			)
+		}()
+		next.ServeHTTP(statusWriter, request)
+	})
 }
 
 func (h *Handler) health(w http.ResponseWriter, request *http.Request) {
@@ -146,6 +200,8 @@ func (h *Handler) preview(w http.ResponseWriter, request *http.Request) {
 		status = http.StatusUnprocessableEntity
 	case errorFileObject:
 		status = http.StatusBadGateway
+	case errorObjectChanged:
+		status = http.StatusConflict
 	case errorInputTooLarge:
 		status = http.StatusRequestEntityTooLarge
 	case errorCanceled:

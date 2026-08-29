@@ -222,6 +222,116 @@ func TestOpenReturnsCallerOwnedSuccessBody(t *testing.T) {
 	}
 }
 
+func TestStatObjectReadsStableIdentityWithHEAD(t *testing.T) {
+	t.Parallel()
+
+	body := &trackingBody{Reader: strings.NewReader("")}
+	client := mustClientWithTransport(t, roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		if req.Method != http.MethodHead {
+			t.Errorf("method = %s, want HEAD", req.Method)
+		}
+		if got, want := req.URL.RequestURI(), "/rsp-reopsc/input/file.txt"; got != want {
+			t.Errorf("RequestURI = %q, want %q", got, want)
+		}
+		header := make(http.Header)
+		header.Set("ETag", `"etag-123"`)
+		header.Set("Content-Length", "42")
+		header.Set("x-amz-version-id", "version-7")
+		return &http.Response{StatusCode: http.StatusOK, Header: header, Body: body, Request: req}, nil
+	}))
+
+	metadata, err := client.StatObject(context.Background(), "input", "file.txt")
+	if err != nil {
+		t.Fatalf("StatObject() error = %v", err)
+	}
+	if want := (ObjectMetadata{ETag: "etag-123", VersionID: "version-7", Size: 42}); metadata != want {
+		t.Fatalf("metadata = %#v, want %#v", metadata, want)
+	}
+	if !body.closed {
+		t.Fatal("StatObject() did not close the HEAD response body")
+	}
+}
+
+func TestStatObjectRejectsMissingOrInvalidIdentity(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name   string
+		etag   string
+		length string
+	}{
+		{name: "missing etag", length: "1"},
+		{name: "missing length", etag: "etag"},
+		{name: "invalid length", etag: "etag", length: "NaN"},
+		{name: "negative length", etag: "etag", length: "-1"},
+	}
+	for _, test := range tests {
+		test := test
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			client := mustClientWithTransport(t, roundTripFunc(func(req *http.Request) (*http.Response, error) {
+				header := make(http.Header)
+				header.Set("ETag", test.etag)
+				header.Set("Content-Length", test.length)
+				return &http.Response{StatusCode: http.StatusOK, Header: header, Body: http.NoBody, Request: req}, nil
+			}))
+			_, err := client.StatObject(context.Background(), "input", "file.txt")
+			if !errors.Is(err, ErrInvalidMetadata) {
+				t.Fatalf("StatObject() error = %v, want ErrInvalidMetadata", err)
+			}
+		})
+	}
+}
+
+func TestOpenObjectSendsRangeAndRequiresPartialContent(t *testing.T) {
+	t.Parallel()
+
+	client := mustClientWithTransport(t, roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		if got := req.Header.Get("Range"); got != "bytes=128-" {
+			t.Errorf("Range = %q, want bytes=128-", got)
+		}
+		return &http.Response{
+			StatusCode: http.StatusPartialContent,
+			Header:     make(http.Header),
+			Body:       io.NopCloser(strings.NewReader("resumed")),
+			Request:    req,
+		}, nil
+	}))
+	body, err := client.OpenObject(context.Background(), "input", "file.txt", 128)
+	if err != nil {
+		t.Fatalf("OpenObject() error = %v", err)
+	}
+	defer body.Close()
+	payload, err := io.ReadAll(body)
+	if err != nil || string(payload) != "resumed" {
+		t.Fatalf("payload = %q, error = %v", payload, err)
+	}
+}
+
+func TestOpenObjectRejectsIgnoredRangeAndNegativeOffset(t *testing.T) {
+	t.Parallel()
+
+	var calls atomic.Int32
+	body := &trackingBody{Reader: strings.NewReader("full object")}
+	client := mustClientWithTransport(t, roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		calls.Add(1)
+		return &http.Response{StatusCode: http.StatusOK, Header: make(http.Header), Body: body, Request: req}, nil
+	}))
+	stream, err := client.OpenObject(context.Background(), "input", "file.txt", 12)
+	if stream != nil || !errors.Is(err, ErrRangeNotSupported) {
+		t.Fatalf("OpenObject() stream = %v, error = %v", stream, err)
+	}
+	if !body.closed {
+		t.Fatal("ignored Range response body was not closed")
+	}
+	if _, err := client.OpenObject(context.Background(), "input", "file.txt", -1); !errors.Is(err, ErrInvalidReference) {
+		t.Fatalf("negative offset error = %v, want ErrInvalidReference", err)
+	}
+	if got := calls.Load(); got != 1 {
+		t.Fatalf("transport calls = %d, want 1", got)
+	}
+}
+
 func TestOpenClosesAndBoundsUnexpectedStatusBody(t *testing.T) {
 	t.Parallel()
 

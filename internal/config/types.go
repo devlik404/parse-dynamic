@@ -13,6 +13,12 @@ const (
 	FileTypeJSON       FileType = "JSON"
 	FileTypeXML        FileType = "XML"
 	FileTypeRaw        FileType = "RAW"
+	FileTypeText       FileType = "TEXT"
+	FileTypeHTML       FileType = "HTML"
+	FileTypeHTM        FileType = "HTM"
+	FileTypePDF        FileType = "PDF"
+	FileTypeXLS        FileType = "XLS"
+	FileTypeXLSX       FileType = "XLSX"
 	// FileTypeSectionedDelimited decodes files whose control records introduce
 	// a section-specific header followed by one or more data records.
 	FileTypeSectionedDelimited FileType = "SECTIONED_DELIMITED"
@@ -108,9 +114,12 @@ type ParserConfig struct {
 	Transforms        []TransformRule
 	RequiredFields    []string
 	MaxRecordBytes    int
+	MaxDocumentBytes  int
 	MaxFields         int
 	AllowExtraColumns bool
 	SkipEmptyLine     bool
+	SpreadsheetSheet  string
+	HTMLTableIndex    int
 	Sectioned         SectionedDelimitedConfig
 }
 

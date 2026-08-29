@@ -1,7 +1,10 @@
 package main
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
+	"log/slog"
 	"net/http"
 	"strings"
 	"testing"
@@ -19,6 +22,7 @@ func TestApplicationModeDefaultsAndAliases(t *testing.T) {
 		{name: "default job", env: map[string]string{}, want: applicationModeJob},
 		{name: "job", env: map[string]string{"APP_MODE": "job"}, want: applicationModeJob},
 		{name: "http", env: map[string]string{"APP_MODE": " HTTP "}, want: applicationModeHTTP},
+		{name: "scheduler", env: map[string]string{"APP_MODE": " scheduler "}, want: applicationModeScheduler},
 		{name: "legacy cli", env: map[string]string{"MODE": "cli"}, want: applicationModeJob},
 		{name: "legacy http", env: map[string]string{"MODE": "http"}, want: applicationModeHTTP},
 		{name: "legacy production", env: map[string]string{"MODE": "production"}, want: applicationModeJob},
@@ -65,6 +69,8 @@ func TestLoadHTTPRuntimeConfig(t *testing.T) {
 	env["PREVIEW_REQUEST_TIMEOUT"] = "12s"
 	env["PREVIEW_MAX_CONCURRENCY"] = "7"
 	env["HTTP_WRITE_TIMEOUT"] = "45s"
+	env["LOG_LEVEL"] = "debug"
+	env["LOG_FORMAT"] = "json"
 
 	cfg, err := loadHTTPRuntimeConfig(testLookup(env))
 	if err != nil {
@@ -91,8 +97,25 @@ func TestLoadHTTPRuntimeConfig(t *testing.T) {
 	if cfg.WriteTimeout != 45*time.Second {
 		t.Fatalf("write timeout = %v", cfg.WriteTimeout)
 	}
+	if cfg.LogLevel != slog.LevelDebug || cfg.LogFormat != "json" {
+		t.Fatalf("logging config = %v/%q", cfg.LogLevel, cfg.LogFormat)
+	}
 	if cfg.Parser.FileType != config.FileTypeSectionedDelimited || cfg.Parser.Delimiter != "|" || cfg.Parser.Sectioned.DataCode != "SB" {
 		t.Fatalf("unexpected startup parser config: %+v", cfg.Parser)
+	}
+}
+
+func TestNewHTTPLoggerSupportsStructuredJSON(t *testing.T) {
+	var output bytes.Buffer
+	cfg := httpRuntimeConfig{LogLevel: slog.LevelInfo, LogFormat: "json"}
+	logger := newHTTPLoggerTo(cfg, &output)
+	logger.Info("server_started", "address", ":8083")
+	var event map[string]any
+	if err := json.Unmarshal(output.Bytes(), &event); err != nil {
+		t.Fatal(err)
+	}
+	if event["msg"] != "server_started" || event["component"] != "parser_http" || event["address"] != ":8083" {
+		t.Fatalf("event = %#v", event)
 	}
 }
 
@@ -165,13 +188,15 @@ func TestLoadHTTPRuntimeConfigRejectsInvalidValuesWithoutSecrets(t *testing.T) {
 	env["PREVIEW_MAX_LIMIT"] = "many"
 	env["MINIO_HTTP_TIMEOUT"] = "later"
 	env["HTTP_IDLE_TIMEOUT"] = "forever"
+	env["LOG_LEVEL"] = "verbose"
+	env["LOG_FORMAT"] = "xml"
 
 	_, err := loadHTTPRuntimeConfig(testLookup(env))
 	if err == nil {
 		t.Fatal("loadHTTPRuntimeConfig() error = nil")
 	}
 	message := err.Error()
-	for _, key := range []string{"MINIO_BASE_URL", "PREVIEW_REQUIRE_AUTH", "HTTP_ADDR", "PREVIEW_MAX_LIMIT", "MINIO_HTTP_TIMEOUT", "HTTP_IDLE_TIMEOUT"} {
+	for _, key := range []string{"MINIO_BASE_URL", "PREVIEW_REQUIRE_AUTH", "HTTP_ADDR", "PREVIEW_MAX_LIMIT", "MINIO_HTTP_TIMEOUT", "HTTP_IDLE_TIMEOUT", "LOG_LEVEL", "LOG_FORMAT"} {
 		if !strings.Contains(message, key) {
 			t.Errorf("error %q does not mention %s", message, key)
 		}

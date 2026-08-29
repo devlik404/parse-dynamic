@@ -1,0 +1,152 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: universal-parser-scheduler
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: universal-parser-scheduler
+  template:
+    metadata:
+      labels:
+        app: universal-parser-scheduler
+    spec:
+      automountServiceAccountToken: false
+      terminationGracePeriodSeconds: 40
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: parser-scheduler
+          image: parser-job:v1.0.0
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 8080
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          resources:
+            requests:
+              cpu: 200m
+              memory: 256Mi
+            limits:
+              cpu: "2"
+              memory: 1Gi
+          envFrom:
+            - configMapRef:
+                name: universal-parser-scheduler-config
+          env:
+            - name: SS_RC_USER
+              valueFrom:
+                secretKeyRef:
+                  name: universal-parser-scheduler-secrets
+                  key: SS_RC_USER
+            - name: SS_RC_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: universal-parser-scheduler-secrets
+                  key: SS_RC_PASSWORD
+            - name: SCH_ENC_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: universal-parser-scheduler-secrets
+                  key: SCH_ENC_KEY
+          volumeMounts:
+            - name: temp
+              mountPath: /tmp
+          readinessProbe:
+            tcpSocket:
+              port: http
+            initialDelaySeconds: 2
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 20
+      volumes:
+        - name: temp
+          emptyDir:
+            sizeLimit: 1Gi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: universal-parser-scheduler
+spec:
+  type: ClusterIP
+  selector:
+    app: universal-parser-scheduler
+  ports:
+    - name: http
+      port: 80
+      targetPort: http
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: universal-parser-scheduler-config
+data:
+  APP_MODE: SCHEDULER
+  HTTP_ADDR: ":8080"
+  LOG_LEVEL: info
+  LOG_FORMAT: json
+  MINIO_BASE_URL: http://sch-minio.reopsc:8080
+  MINIO_BUCKET_NAME: rsp-reopsc
+  MINIO_HTTP_TIMEOUT: 10m
+  MINIO_PATH_PREFIX: ""
+  SS_RC_HOST: mssql-config.reopsc.svc
+  SS_RC_PORT: "1433"
+  SS_RC_DB_PARAM_ENGINE: ParamEngine
+  SS_RC_DB_RECON_CONFIG: ReconConfig
+  SS_TR_PORT: "1433"
+  DYNAMIC_DB_SSL_MODE: require
+  DYNAMIC_DB_CONNECT_TIMEOUT: 30s
+  DYNAMIC_PARAM_SCHEMA: dbo
+  DYNAMIC_EXISTING_PROFILE_TABLE: ParamParseFile
+  DYNAMIC_EXISTING_MAPPING_TABLE: ParamParseFileMappingColumn
+  DYNAMIC_PRODUCT_TABLE: Product
+  DYNAMIC_READER_TABLE: ParamReadFile
+  DYNAMIC_READER_COLUMN_TABLE: ParamReadFileColumn
+  DYNAMIC_PASSWORD_DECRYPT_FUNCTION: fnDecrypt
+  DYNAMIC_BATCH_SIZE: "500"
+  DYNAMIC_BATCH_MAX_BYTES: "67108864"
+  DYNAMIC_MAX_INPUT_BYTES: "536870912"
+  DYNAMIC_MAX_RECORD_BYTES: "8388608"
+  DYNAMIC_MAX_DOCUMENT_BYTES: "536870912"
+  DYNAMIC_MAX_FIELDS: "100000"
+  DYNAMIC_MAX_REQUEST_BYTES: "16384"
+  DYNAMIC_REQUEST_TIMEOUT: 10m
+  DYNAMIC_MAX_CONCURRENCY: "4"
+  # Keep false only when NetworkPolicy/internal ingress is the auth boundary.
+  DYNAMIC_REQUIRE_AUTH: "false"
+  HTTP_READ_HEADER_TIMEOUT: 5s
+  HTTP_READ_TIMEOUT: 30s
+  HTTP_WRITE_TIMEOUT: 15m
+  HTTP_IDLE_TIMEOUT: 60s
+  HTTP_SHUTDOWN_TIMEOUT: 30s
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: universal-parser-scheduler-ingress
+spec:
+  podSelector:
+    matchLabels:
+      app: universal-parser-scheduler
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app: sch-parse-file
+      ports:
+        - protocol: TCP
+          port: 8080

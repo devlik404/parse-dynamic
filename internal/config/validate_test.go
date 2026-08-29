@@ -41,7 +41,7 @@ func TestValidateCrossFieldRules(t *testing.T) {
 		},
 		{
 			name: "unsupported file and data types",
-			edit: func(cfg *JobConfig) { cfg.Parser.FileType = "PDF"; cfg.Parser.Columns[0].Type = "money" },
+			edit: func(cfg *JobConfig) { cfg.Parser.FileType = "ARCHIVE"; cfg.Parser.Columns[0].Type = "money" },
 			want: []string{"PARSER_FILE_TYPE", "PARSER_TYPES"},
 		},
 		{

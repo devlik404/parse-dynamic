@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -15,6 +16,7 @@ import (
 	"unicode/utf8"
 
 	"parser-engine/internal/config"
+	"parser-engine/internal/miniogateway"
 )
 
 const testBearerToken = "0123456789abcdef0123456789abcdef"
@@ -90,6 +92,48 @@ type objectSourceFunc func(context.Context, string, string) (io.ReadCloser, erro
 
 func (f objectSourceFunc) Open(ctx context.Context, minioPath, fileName string) (io.ReadCloser, error) {
 	return f(ctx, minioPath, fileName)
+}
+
+type metadataObjectSource struct {
+	mu       sync.Mutex
+	data     []byte
+	metadata []miniogateway.ObjectMetadata
+	stats    int
+	opens    int
+}
+
+func (s *metadataObjectSource) StatObject(ctx context.Context, _, _ string) (miniogateway.ObjectMetadata, error) {
+	if err := ctx.Err(); err != nil {
+		return miniogateway.ObjectMetadata{}, err
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if len(s.metadata) == 0 {
+		return miniogateway.ObjectMetadata{}, errors.New("metadata unavailable")
+	}
+	index := s.stats
+	if index >= len(s.metadata) {
+		index = len(s.metadata) - 1
+	}
+	s.stats++
+	return s.metadata[index], nil
+}
+
+func (s *metadataObjectSource) Open(ctx context.Context, minioPath, fileName string) (io.ReadCloser, error) {
+	return s.OpenObject(ctx, minioPath, fileName, 0)
+}
+
+func (s *metadataObjectSource) OpenObject(ctx context.Context, _, _ string, offset int64) (io.ReadCloser, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.opens++
+	if offset < 0 || offset > int64(len(s.data)) {
+		return nil, errors.New("invalid offset")
+	}
+	return io.NopCloser(bytes.NewReader(append([]byte(nil), s.data[offset:]...))), nil
 }
 
 func validBaseConfig() config.ParserConfig {
@@ -428,6 +472,74 @@ func TestSourceFailureIsClassifiedWithoutLeakingCause(t *testing.T) {
 	}
 	if strings.Contains(recorder.Body.String(), "minio-secret") {
 		t.Fatalf("source cause leaked: %s", recorder.Body.String())
+	}
+}
+
+func TestMetadataFlowRejectsOversizedObjectBeforeGET(t *testing.T) {
+	source := &metadataObjectSource{
+		metadata: []miniogateway.ObjectMetadata{{ETag: "etag-1", Size: 6}},
+	}
+	handler := newTestHandler(t, source, validBaseConfig(), func(opts *Options) {
+		opts.MaxInputBytes = 5
+	})
+	recorder := performJSON(handler, `{"final_minio_path":"rsp/atm-bersama","final_file_name":"report.txt"}`, "")
+	if recorder.Code != http.StatusRequestEntityTooLarge || !strings.Contains(recorder.Body.String(), `"code":"INPUT_TOO_LARGE"`) {
+		t.Fatalf("status/body = %d/%s", recorder.Code, recorder.Body.String())
+	}
+	source.mu.Lock()
+	defer source.mu.Unlock()
+	if source.stats != 1 || source.opens != 0 {
+		t.Fatalf("stats/opens = %d/%d, want 1/0", source.stats, source.opens)
+	}
+}
+
+func TestMetadataFlowVerifiesObjectIdentityAfterFullRead(t *testing.T) {
+	data := []byte("hello")
+	metadata := miniogateway.ObjectMetadata{ETag: "etag-1", VersionID: "version-1", Size: int64(len(data))}
+	source := &metadataObjectSource{data: data, metadata: []miniogateway.ObjectMetadata{metadata, metadata}}
+	handler := newTestHandler(t, source, validBaseConfig(), nil)
+	recorder := performJSON(handler, `{"final_minio_path":"rsp/atm-bersama","final_file_name":"report.txt"}`, "")
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status/body = %d/%s", recorder.Code, recorder.Body.String())
+	}
+	source.mu.Lock()
+	defer source.mu.Unlock()
+	if source.stats != 2 || source.opens != 1 {
+		t.Fatalf("stats/opens = %d/%d, want 2/1", source.stats, source.opens)
+	}
+}
+
+func TestMetadataFlowRejectsObjectChangedDuringRead(t *testing.T) {
+	data := []byte("hello")
+	source := &metadataObjectSource{
+		data: data,
+		metadata: []miniogateway.ObjectMetadata{
+			{ETag: "etag-1", VersionID: "version-1", Size: int64(len(data))},
+			{ETag: "etag-2", VersionID: "version-2", Size: int64(len(data))},
+		},
+	}
+	handler := newTestHandler(t, source, validBaseConfig(), nil)
+	recorder := performJSON(handler, `{"final_minio_path":"rsp/atm-bersama","final_file_name":"report.txt"}`, "")
+	if recorder.Code != http.StatusConflict || !strings.Contains(recorder.Body.String(), `"code":"OBJECT_CHANGED"`) {
+		t.Fatalf("status/body = %d/%s", recorder.Code, recorder.Body.String())
+	}
+}
+
+func TestMetadataFlowRejectsBodyLengthDifferentFromHEAD(t *testing.T) {
+	for _, reportedSize := range []int64{4, 6} {
+		reportedSize := reportedSize
+		t.Run(fmt.Sprintf("reported-size-%d", reportedSize), func(t *testing.T) {
+			data := []byte("hello")
+			source := &metadataObjectSource{
+				data:     data,
+				metadata: []miniogateway.ObjectMetadata{{ETag: "etag-1", Size: reportedSize}},
+			}
+			handler := newTestHandler(t, source, validBaseConfig(), nil)
+			recorder := performJSON(handler, `{"final_minio_path":"rsp/atm-bersama","final_file_name":"report.txt"}`, "")
+			if recorder.Code != http.StatusConflict || !strings.Contains(recorder.Body.String(), `"code":"OBJECT_CHANGED"`) {
+				t.Fatalf("status/body = %d/%s", recorder.Code, recorder.Body.String())
+			}
+		})
 	}
 }
 

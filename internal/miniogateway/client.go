@@ -1,5 +1,5 @@
 // Package miniogateway provides read-only, streaming access to the HTTP
-// object gateway used by cashrecon-sch-parse-file-atm-bersama.
+// object gateway used by the cashrecon parsing jobs.
 package miniogateway
 
 import (
@@ -9,6 +9,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 	"time"
 	"unicode"
@@ -42,7 +43,24 @@ var (
 	ErrUnexpectedStatus = errors.New("MinIO gateway returned an unexpected status")
 	// ErrObjectNotFound additionally identifies an HTTP 404 response.
 	ErrObjectNotFound = errors.New("MinIO object not found")
+	// ErrInvalidMetadata identifies a successful HEAD response that does not
+	// contain the stable object identity required by the processing flow.
+	ErrInvalidMetadata = errors.New("MinIO object metadata is invalid")
+	// ErrRangeNotSupported identifies a gateway that ignored a resume Range.
+	ErrRangeNotSupported = errors.New("MinIO gateway did not honor the Range request")
 )
+
+// ObjectMetadata is the stable identity returned by the MinIO HTTP gateway.
+// It mirrors the contract used by cashrecon-sch-parse-file-qris-tap.
+type ObjectMetadata struct {
+	ETag      string
+	VersionID string
+	Size      int64
+}
+
+func (m ObjectMetadata) SameObject(other ObjectMetadata) bool {
+	return m.ETag == other.ETag && m.VersionID == other.VersionID && m.Size == other.Size
+}
 
 // Config describes the HTTP object gateway used by the existing cashrecon
 // job. BaseURL may include a fixed path prefix, but must not contain userinfo,
@@ -185,11 +203,67 @@ func New(cfg Config) (*Client, error) {
 	}, nil
 }
 
-// Open streams one object using the same URL contract as the existing job:
-// GET ${MINIO_BASE_URL}/${MINIO_BUCKET_NAME}/${minioPath}/${fileName}.
-// The caller owns the returned body and must close it. Open deliberately sends
-// no separate list/existence request; HTTP 404 is reported as ErrObjectNotFound.
+// StatObject reads the identity and size used to validate a subsequent stream.
+// The gateway must return ETag and Content-Length; x-amz-version-id is optional.
+func (c *Client) StatObject(ctx context.Context, minioPath, fileName string) (ObjectMetadata, error) {
+	if c == nil || c.httpClient == nil {
+		return ObjectMetadata{}, &RequestError{cause: errors.New("gateway client is not initialized")}
+	}
+	if ctx == nil {
+		return ObjectMetadata{}, &ReferenceError{Field: "context", Problem: "must not be nil"}
+	}
+	if err := ValidateReference(minioPath, fileName); err != nil {
+		return ObjectMetadata{}, err
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodHead, c.objectURL(minioPath, fileName), nil)
+	if err != nil {
+		return ObjectMetadata{}, &RequestError{cause: err}
+	}
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		if resp != nil && resp.Body != nil {
+			_ = resp.Body.Close()
+		}
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return ObjectMetadata{}, ctxErr
+		}
+		return ObjectMetadata{}, &RequestError{cause: err}
+	}
+	if resp == nil || resp.Body == nil {
+		return ObjectMetadata{}, &RequestError{cause: errors.New("gateway returned an invalid response")}
+	}
+	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
+		discardAndClose(resp.Body)
+		return ObjectMetadata{}, &StatusError{StatusCode: resp.StatusCode}
+	}
+	_ = resp.Body.Close()
+
+	etag := strings.Trim(strings.TrimSpace(resp.Header.Get("ETag")), `"`)
+	if etag == "" {
+		return ObjectMetadata{}, ErrInvalidMetadata
+	}
+	size, err := strconv.ParseInt(strings.TrimSpace(resp.Header.Get("Content-Length")), 10, 64)
+	if err != nil || size < 0 {
+		return ObjectMetadata{}, ErrInvalidMetadata
+	}
+	return ObjectMetadata{
+		ETag:      etag,
+		VersionID: strings.TrimSpace(resp.Header.Get("x-amz-version-id")),
+		Size:      size,
+	}, nil
+}
+
+// Open streams one object from offset zero. It is retained as a compatibility
+// alias for callers that do not need metadata/checkpoint semantics.
 func (c *Client) Open(ctx context.Context, minioPath, fileName string) (io.ReadCloser, error) {
+	return c.OpenObject(ctx, minioPath, fileName, 0)
+}
+
+// OpenObject streams one object using the same URL contract as the existing job:
+// GET ${MINIO_BASE_URL}/${MINIO_BUCKET_NAME}/${minioPath}/${fileName}.
+// A positive offset sends Range: bytes=<offset>- and requires HTTP 206.
+// The caller owns the returned body and must close it.
+func (c *Client) OpenObject(ctx context.Context, minioPath, fileName string, offset int64) (io.ReadCloser, error) {
 	if c == nil || c.httpClient == nil {
 		return nil, &RequestError{cause: errors.New("gateway client is not initialized")}
 	}
@@ -199,6 +273,9 @@ func (c *Client) Open(ctx context.Context, minioPath, fileName string) (io.ReadC
 	if err := ValidateReference(minioPath, fileName); err != nil {
 		return nil, err
 	}
+	if offset < 0 {
+		return nil, &ReferenceError{Field: "offset", Problem: "must be zero or greater"}
+	}
 
 	objectURL := c.objectURL(minioPath, fileName)
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, objectURL, nil)
@@ -206,6 +283,9 @@ func (c *Client) Open(ctx context.Context, minioPath, fileName string) (io.ReadC
 		return nil, &RequestError{cause: err}
 	}
 	req.Header.Set("Accept", "application/octet-stream")
+	if offset > 0 {
+		req.Header.Set("Range", fmt.Sprintf("bytes=%d-", offset))
+	}
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
@@ -226,6 +306,10 @@ func (c *Client) Open(ctx context.Context, minioPath, fileName string) (io.ReadC
 	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
 		discardAndClose(resp.Body)
 		return nil, &StatusError{StatusCode: resp.StatusCode}
+	}
+	if offset > 0 && resp.StatusCode != http.StatusPartialContent {
+		discardAndClose(resp.Body)
+		return nil, ErrRangeNotSupported
 	}
 
 	return resp.Body, nil

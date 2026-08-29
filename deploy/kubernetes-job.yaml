@@ -45,6 +45,8 @@ spec:
               readOnly: true
             - name: errors
               mountPath: /data/errors
+            - name: temp
+              mountPath: /tmp
       volumes:
         - name: input
           persistentVolumeClaim:
@@ -52,6 +54,9 @@ spec:
         - name: errors
           persistentVolumeClaim:
             claimName: parser-errors
+        - name: temp
+          emptyDir:
+            sizeLimit: 256Mi
 ---
 apiVersion: v1
 kind: ConfigMap
@@ -70,6 +75,7 @@ data:
   PARSER_DATE_FORMAT: "20060102"
   PARSER_TRIM_SPACE: "true"
   PARSER_MAX_RECORD_BYTES: "1048576"
+  PARSER_MAX_DOCUMENT_BYTES: "67108864"
   PARSER_MAX_FIELDS: "10000"
   DB_DRIVER: postgres
   DB_HOST: postgres.default.svc

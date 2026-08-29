@@ -11,14 +11,15 @@ import (
 )
 
 const (
-	maxApplicationBatchSize  = 10_000
-	maxApplicationBatchBytes = 128 * 1024 * 1024
-	maxApplicationRecordSize = 8 * 1024 * 1024
-	maxApplicationFields     = 100_000
-	maxApplicationTransforms = 256
-	maxConfigProblems        = 128
-	maxConfigProblemBytes    = 1024
-	maxConfigLabelBytes      = 128
+	maxApplicationBatchSize    = 10_000
+	maxApplicationBatchBytes   = 128 * 1024 * 1024
+	maxApplicationRecordSize   = 8 * 1024 * 1024
+	maxApplicationDocumentSize = 512 * 1024 * 1024
+	maxApplicationFields       = 100_000
+	maxApplicationTransforms   = 256
+	maxConfigProblems          = 128
+	maxConfigProblemBytes      = 1024
+	maxConfigLabelBytes        = 128
 )
 
 const omittedConfigProblems = "additional configuration problems were omitted"
@@ -146,10 +147,11 @@ func validateParserProblems(parser ParserConfig) []string {
 	validFileTypes := map[FileType]bool{
 		FileTypeDelimited: true, FileTypeCSV: true, FileTypeTSV: true,
 		FileTypeFixedWidth: true, FileTypeJSON: true, FileTypeXML: true,
-		FileTypeRaw: true, FileTypeSectionedDelimited: true,
+		FileTypeRaw: true, FileTypeText: true, FileTypeHTML: true, FileTypeHTM: true,
+		FileTypePDF: true, FileTypeXLS: true, FileTypeXLSX: true, FileTypeSectionedDelimited: true,
 	}
 	if !validFileTypes[parser.FileType] {
-		add("PARSER_FILE_TYPE must be one of DELIMITED, CSV, TSV, FIXED_WIDTH, JSON, XML, RAW, SECTIONED_DELIMITED")
+		add("PARSER_FILE_TYPE must be one of DELIMITED, CSV, TSV, FIXED_WIDTH, JSON, XML, RAW, TEXT, HTML, HTM, PDF, XLS, XLSX, SECTIONED_DELIMITED")
 	}
 
 	validTypes := map[DataType]bool{
@@ -399,7 +401,7 @@ func validateMappings(parser ParserConfig, columns map[string]struct{}, add func
 		}
 
 		switch parser.FileType {
-		case FileTypeDelimited, FileTypeCSV, FileTypeTSV:
+		case FileTypeDelimited, FileTypeCSV, FileTypeTSV, FileTypeHTML, FileTypeHTM, FileTypeXLS, FileTypeXLSX:
 			if !parser.HasHeader {
 				position, err := strconv.Atoi(mapping.Source)
 				if err != nil || position < 0 {
@@ -410,9 +412,13 @@ func validateMappings(parser ParserConfig, columns map[string]struct{}, add func
 			if _, exists := fixedNames[mapping.Source]; !exists {
 				add("%s source %q is not declared in PARSER_FIXED_WIDTH_FIELDS", key, configLabel(mapping.Source))
 			}
-		case FileTypeRaw:
+		case FileTypeRaw, FileTypeText:
 			if mapping.Source != "raw" {
-				add("%s source must be %q when PARSER_FILE_TYPE=RAW", key, "raw")
+				add("%s source must be %q when PARSER_FILE_TYPE=RAW or TEXT", key, "raw")
+			}
+		case FileTypePDF:
+			if mapping.Source != "page" && mapping.Source != "text" && mapping.Source != "raw" && mapping.Source != "value" {
+				add("%s source %q must be page, text, raw, or value when PARSER_FILE_TYPE=PDF", key, configLabel(mapping.Source))
 			}
 		}
 	}
@@ -439,6 +445,23 @@ func validateParserOptions(parser ParserConfig, columns map[string]struct{}, add
 		add("PARSER_MAX_RECORD_BYTES must be greater than zero")
 	} else if parser.MaxRecordBytes > maxApplicationRecordSize {
 		add("PARSER_MAX_RECORD_BYTES must not exceed %d", maxApplicationRecordSize)
+	}
+	if parser.FileType == FileTypePDF || parser.FileType == FileTypeXLS || parser.FileType == FileTypeXLSX {
+		if parser.MaxDocumentBytes <= 0 {
+			add("PARSER_MAX_DOCUMENT_BYTES must be greater than zero")
+		} else if parser.MaxDocumentBytes > maxApplicationDocumentSize {
+			add("PARSER_MAX_DOCUMENT_BYTES must not exceed %d", maxApplicationDocumentSize)
+		}
+	}
+	if parser.FileType == FileTypeXLS || parser.FileType == FileTypeXLSX {
+		if strings.TrimSpace(parser.SpreadsheetSheet) == "" {
+			add("PARSER_SPREADSHEET_SHEET must be a worksheet name or zero-based index")
+		} else if index, err := strconv.Atoi(parser.SpreadsheetSheet); err == nil && index < 0 {
+			add("PARSER_SPREADSHEET_SHEET index must be zero or greater")
+		}
+	}
+	if (parser.FileType == FileTypeHTML || parser.FileType == FileTypeHTM) && parser.HTMLTableIndex < 0 {
+		add("PARSER_HTML_TABLE_INDEX must be zero or greater")
 	}
 	if parser.MaxFields <= 0 {
 		add("PARSER_MAX_FIELDS must be greater than zero")

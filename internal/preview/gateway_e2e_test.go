@@ -5,6 +5,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -51,6 +52,7 @@ func TestMinIOGatewayToPreviewHandlerSectionedDelimitedEndToEnd(t *testing.T) {
 		url        string
 		requestURI string
 		accept     string
+		rangeValue string
 	}
 	var requests []gatewayRequest
 	gatewayTransport := roundTripFunc(func(request *http.Request) (*http.Response, error) {
@@ -59,7 +61,21 @@ func TestMinIOGatewayToPreviewHandlerSectionedDelimitedEndToEnd(t *testing.T) {
 			url:        request.URL.String(),
 			requestURI: request.URL.RequestURI(),
 			accept:     request.Header.Get("Accept"),
+			rangeValue: request.Header.Get("Range"),
 		})
+		if request.Method == http.MethodHead {
+			header := make(http.Header)
+			header.Set("ETag", `"atm-bersama-v1"`)
+			header.Set("Content-Length", strconv.Itoa(len(atmBersamaGatewaySample)))
+			header.Set("x-amz-version-id", "version-1")
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Status:     "200 OK",
+				Header:     header,
+				Body:       http.NoBody,
+				Request:    request,
+			}, nil
+		}
 		return &http.Response{
 			StatusCode: http.StatusOK,
 			Status:     "200 OK",
@@ -122,7 +138,7 @@ func TestMinIOGatewayToPreviewHandlerSectionedDelimitedEndToEnd(t *testing.T) {
 		"final_file_name": "` + fileName + `",
 		"limit": 10
 	}`
-	request := httptest.NewRequest(http.MethodPost, "/parse-file-dyanmic", strings.NewReader(requestBody))
+	request := httptest.NewRequest(http.MethodPost, preview.Route, strings.NewReader(requestBody))
 	request.Header.Set("Content-Type", "application/json")
 	recorder := httptest.NewRecorder()
 	handler.ServeHTTP(recorder, request)
@@ -165,13 +181,15 @@ func TestMinIOGatewayToPreviewHandlerSectionedDelimitedEndToEnd(t *testing.T) {
 		t.Fatalf("last TOTAL_GROSS = %#v", lastPayload["TOTAL_GROSS"])
 	}
 
-	if len(requests) != 1 {
-		t.Fatalf("gateway request count = %d, want exactly 1: %#v", len(requests), requests)
+	if len(requests) != 3 {
+		t.Fatalf("gateway request count = %d, want HEAD/GET/HEAD: %#v", len(requests), requests)
 	}
-	if requests[0].method != http.MethodGet || requests[0].url != objectURL || requests[0].requestURI != objectPath {
-		t.Fatalf("gateway request = %#v, want GET %s", requests[0], objectURL)
+	for index, method := range []string{http.MethodHead, http.MethodGet, http.MethodHead} {
+		if requests[index].method != method || requests[index].url != objectURL || requests[index].requestURI != objectPath {
+			t.Fatalf("gateway request[%d] = %#v, want %s %s", index, requests[index], method, objectURL)
+		}
 	}
-	if requests[0].accept != "application/octet-stream" {
-		t.Fatalf("gateway Accept header = %q", requests[0].accept)
+	if requests[1].accept != "application/octet-stream" || requests[1].rangeValue != "" {
+		t.Fatalf("gateway GET headers = %#v", requests[1])
 	}
 }

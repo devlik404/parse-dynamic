@@ -13,11 +13,12 @@ import (
 )
 
 const (
-	defaultMaxRecordBytes = 1024 * 1024
-	defaultMaxFields      = 10_000
-	defaultBatchSize      = 1000
-	defaultBatchMaxBytes  = 64 * 1024 * 1024
-	defaultConnectTimeout = 30 * time.Second
+	defaultMaxRecordBytes   = 1024 * 1024
+	defaultMaxDocumentBytes = 64 * 1024 * 1024
+	defaultMaxFields        = 10_000
+	defaultBatchSize        = 1000
+	defaultBatchMaxBytes    = 64 * 1024 * 1024
+	defaultConnectTimeout   = 30 * time.Second
 )
 
 // LookupFunc makes configuration loading deterministic and easy to test. Its
@@ -109,15 +110,17 @@ func Load(lookup LookupFunc) (JobConfig, error) {
 
 func loadParserConfig(l *envLoader, skipEmptyLine bool) ParserConfig {
 	cfg := ParserConfig{
-		FixedWidthUnit: "BYTE",
-		JSONMode:       JSONModeAuto,
-		DateFormat:     "2006-01-02",
-		DateTimeFormat: time.RFC3339,
-		Timezone:       "UTC",
-		DefaultValues:  make(map[string]string),
-		MaxRecordBytes: defaultMaxRecordBytes,
-		MaxFields:      defaultMaxFields,
-		SkipEmptyLine:  skipEmptyLine,
+		FixedWidthUnit:   "BYTE",
+		JSONMode:         JSONModeAuto,
+		DateFormat:       "2006-01-02",
+		DateTimeFormat:   time.RFC3339,
+		Timezone:         "UTC",
+		DefaultValues:    make(map[string]string),
+		MaxRecordBytes:   defaultMaxRecordBytes,
+		MaxDocumentBytes: defaultMaxDocumentBytes,
+		MaxFields:        defaultMaxFields,
+		SkipEmptyLine:    skipEmptyLine,
+		SpreadsheetSheet: "0",
 		Sectioned: SectionedDelimitedConfig{
 			RecordTypeIndex:       0,
 			SectionKeyIndex:       1,
@@ -141,7 +144,10 @@ func loadParserConfig(l *envLoader, skipEmptyLine bool) ParserConfig {
 	cfg.NullIfEmpty = l.boolValue("PARSER_NULL_IF_EMPTY", false)
 	cfg.AllowExtraColumns = l.boolValue("PARSER_ALLOW_EXTRA_COLUMNS", false)
 	cfg.MaxRecordBytes = l.intValue("PARSER_MAX_RECORD_BYTES", cfg.MaxRecordBytes)
+	cfg.MaxDocumentBytes = l.intValue("PARSER_MAX_DOCUMENT_BYTES", cfg.MaxDocumentBytes)
 	cfg.MaxFields = l.intValue("PARSER_MAX_FIELDS", cfg.MaxFields)
+	cfg.SpreadsheetSheet = l.stringValue("PARSER_SPREADSHEET_SHEET", cfg.SpreadsheetSheet)
+	cfg.HTMLTableIndex = l.intValue("PARSER_HTML_TABLE_INDEX", cfg.HTMLTableIndex)
 	cfg.Sectioned.RecordTypeIndex = l.intValue("PARSER_RECORD_TYPE_INDEX", cfg.Sectioned.RecordTypeIndex)
 	cfg.Sectioned.SectionKeyIndex = l.intValue("PARSER_SECTION_KEY_INDEX", cfg.Sectioned.SectionKeyIndex)
 	cfg.Sectioned.FileHeaderCode = l.stringValue("PARSER_FILE_HEADER_CODE", cfg.Sectioned.FileHeaderCode)
@@ -520,14 +526,14 @@ func normalizeParser(parser *ParserConfig) {
 			for _, field := range parser.FixedWidthFields {
 				parser.Mappings = append(parser.Mappings, FieldMapping{Source: field.Name, Target: field.Name})
 			}
-		case FileTypeRaw:
+		case FileTypeRaw, FileTypeText:
 			if len(parser.Columns) == 0 {
 				parser.Columns = []ColumnSpec{{Name: "raw", Type: TypeString}}
 			}
 			if len(parser.Columns) == 1 {
 				parser.Mappings = []FieldMapping{{Source: "raw", Target: parser.Columns[0].Name}}
 			}
-		case FileTypeJSON, FileTypeXML, FileTypeSectionedDelimited:
+		case FileTypeJSON, FileTypeXML, FileTypeHTML, FileTypeHTM, FileTypePDF, FileTypeXLS, FileTypeXLSX, FileTypeSectionedDelimited:
 			for _, column := range parser.Columns {
 				parser.Mappings = append(parser.Mappings, FieldMapping{Source: column.Name, Target: column.Name})
 			}

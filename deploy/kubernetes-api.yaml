@@ -40,6 +40,9 @@ spec:
           envFrom:
             - configMapRef:
                 name: universal-parser-api-config
+          volumeMounts:
+            - name: temp
+              mountPath: /tmp
           readinessProbe:
             tcpSocket:
               port: http
@@ -51,6 +54,10 @@ spec:
               port: http
             initialDelaySeconds: 5
             periodSeconds: 20
+      volumes:
+        - name: temp
+          emptyDir:
+            sizeLimit: 512Mi
 ---
 apiVersion: v1
 kind: Service
@@ -71,6 +78,8 @@ metadata:
 data:
   APP_MODE: HTTP
   HTTP_ADDR: ":8080"
+  LOG_LEVEL: info
+  LOG_FORMAT: json
   # Same HTTP object-gateway contract as cashrecon-sch-parse-file-atm-bersama.
   MINIO_BASE_URL: http://sch-minio.reopsc:8080
   MINIO_BUCKET_NAME: rsp-reopsc
@@ -114,6 +123,7 @@ data:
   PARSER_NULL_IF_EMPTY: "true"
   PARSER_ALLOW_EXTRA_COLUMNS: "false"
   PARSER_MAX_RECORD_BYTES: "1048576"
+  PARSER_MAX_DOCUMENT_BYTES: "67108864"
   PARSER_MAX_FIELDS: "10000"
 ---
 apiVersion: networking.k8s.io/v1

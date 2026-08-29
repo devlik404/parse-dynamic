@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"fmt"
 
+	"parser-engine/internal/config"
 	"parser-engine/internal/model"
 	"parser-engine/internal/repository"
 )
@@ -25,6 +26,30 @@ type SQLRepository struct {
 	dialect   dialect
 	builder   insertBuilder
 	batchSize int
+}
+
+// NewWithDB creates a repository over an already-open pool. The repository
+// takes ownership of db and Close closes it. This is used by scheduler mode,
+// which must query reader parameters from the target database before building
+// the dynamic insert configuration for that same database.
+func NewWithDB(db *sql.DB, cfg config.DBConfig) (*SQLRepository, error) {
+	if db == nil {
+		return nil, fmt.Errorf("SQL database connection is required")
+	}
+	d, err := resolveDialect(cfg.Driver)
+	if err != nil {
+		return nil, err
+	}
+	builder, err := newInsertBuilder(cfg, d)
+	if err != nil {
+		return nil, err
+	}
+	return &SQLRepository{
+		db:        db,
+		dialect:   d,
+		builder:   builder,
+		batchSize: normalizedBatchSize(cfg.BatchSize),
+	}, nil
 }
 
 func (r *SQLRepository) Insert(ctx context.Context, records []model.Record) error {

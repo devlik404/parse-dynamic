@@ -64,8 +64,16 @@ func New(cfg config.ParserConfig) (StreamParser, error) {
 			return nil, fmt.Errorf("PARSER_XML_RECORD_PATH is required for XML")
 		}
 		return &xmlParser{cfg: cfg, recordPath: path}, nil
-	case config.FileTypeRaw:
+	case config.FileTypeRaw, config.FileTypeText:
 		return &rawParser{cfg: cfg}, nil
+	case config.FileTypeHTML, config.FileTypeHTM:
+		return &htmlParser{cfg: cfg}, nil
+	case config.FileTypePDF:
+		return &pdfParser{cfg: cfg}, nil
+	case config.FileTypeXLS:
+		return &xlsParser{cfg: cfg}, nil
+	case config.FileTypeXLSX:
+		return &xlsxParser{cfg: cfg}, nil
 	case config.FileTypeSectionedDelimited:
 		return newSectionedDelimitedParser(cfg)
 	default:

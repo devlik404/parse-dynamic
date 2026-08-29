@@ -31,6 +31,8 @@ func main() {
 		switch mode {
 		case applicationModeHTTP:
 			err = runHTTP(ctx)
+		case applicationModeScheduler:
+			err = runScheduler(ctx)
 		default:
 			err = run(ctx, os.Stdout)
 		}
