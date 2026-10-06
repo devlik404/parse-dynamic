@@ -278,6 +278,7 @@ func (p *csvParser) Parse(ctx context.Context, input io.Reader, fileName string,
 
 		recordNumber++
 		expected := expectedFieldCount(p.cfg, header)
+		fields = padMissingFields(p.cfg, expected, fields)
 		raw := append([]string(nil), fields...)
 		if countMismatch(p.cfg, expected, len(fields)) {
 			recordErr := parseError(fileName, recordNumber, framed.startLine, "", "COLUMN_COUNT_MISMATCH",

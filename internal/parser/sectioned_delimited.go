@@ -223,7 +223,8 @@ func (p *sectionedDelimitedParser) Parse(ctx context.Context, r io.Reader, fileN
 				break
 			}
 			expected := p.sectioned.DataStartIndex + len(active.headers)
-			if len(fields) < expected || (!p.cfg.AllowExtraColumns && len(fields) > expected) {
+			fields = padMissingFields(p.cfg, expected, fields)
+			if countMismatch(p.cfg, expected, len(fields)) {
 				if err := yield(p.dataError(fileName, recordNumber, lineNumber, "COLUMN_COUNT_MISMATCH",
 					fmt.Sprintf("expected %d columns for the active section, got %d", expected, len(fields)), line)); err != nil {
 					return err

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"io"
 	"strings"
@@ -233,5 +234,68 @@ func TestCompilePlanRejectsTrailingTransformJSON(t *testing.T) {
 	)
 	if err == nil || !strings.Contains(err.Error(), "trailing TransformConfigJSON") {
 		t.Fatalf("compilePlan() error = %v", err)
+	}
+}
+
+func TestServiceExecuteRegisteredRHDataTrailerFormat(t *testing.T) {
+	profile := readerProfile{
+		ID: 8, FileType: "DELIMITED", Delimiter: sql.NullString{String: "|", Valid: true},
+		FixedWidthUnit: "BYTE", JSONMode: "AUTO", DateFormat: "20060102",
+		TimeFormat: "150405", DateTimeFormat: time.RFC3339, Timezone: "Asia/Jakarta",
+		TrimSpace: true, NullIfEmpty: true, AllowExtraColumns: true, AllowMissingColumns: true,
+		SkipEmptyLine: true, MaxRecordBytes: 4096, MaxDocumentBytes: 4096, MaxFields: 100,
+		SpreadsheetSheet: "0", RecordTypeIndex: 0, DataStartIndex: 1,
+		FileHeaderCode:        sql.NullString{String: "RH", Valid: true},
+		DataCode:              sql.NullString{String: "DH", Valid: true},
+		FileFooterCode:        sql.NullString{String: "RT", Valid: true},
+		DuplicateHeaderPolicy: "ERROR",
+	}
+	columns := []readerColumn{
+		{Col: 4, SourceName: "transaction_date", DataType: "date", NormalizeCase: "NONE"},
+		{Col: 5, SourceName: "transaction_time", DataType: "time", NormalizeCase: "NONE"},
+		{Col: 7, SourceName: "transaction_amount", DataType: "decimal", NormalizeCase: "NONE"},
+	}
+	mappings := []targetMapping{
+		{Col: 4, Target: "transaction_date"},
+		{Col: 5, Target: "transaction_time"},
+		{Col: 7, Target: "transaction_amount"},
+	}
+	parserCfg, _, err := compilePlan(
+		profile, columns, mappings, legacyProfile{TargetTable: "dbo.QRT_RECON_ACQ"},
+		targetConnection{Database: "Recon"}, normalizeStoreConfig(StoreConfig{}),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if parserCfg.Mappings[0].Source != "4" || parserCfg.Mappings[1].Source != "5" || parserCfg.Mappings[2].Source != "7" {
+		t.Fatalf("derived source selectors = %#v", parserCfg.Mappings)
+	}
+
+	data := []byte("RH|360004|000002|20240224\r\n" +
+		"DH|OQ36000020095031|000000242309|9360000210001236441|20240222|235244|390000|000000000000|360|4829|000|00093600002|00093600014|00000360002|00|9360001410483112180         |                    |242309|0210|Q003|785401001522500             |2\r\n" +
+		"DH|OQ36000020095031|000000242310|9360000210001236441|20240222|235255|401010|000000015000|360|4829|000|00093600002|00093600014|00000360002|00|9360001410483112180         |00001236440000123644|235255|0210|Q003|785401001522500             |2\r\n" +
+		"RT|360004|000002|20240224|400|95912953\r\n")
+	metadata := miniogateway.ObjectMetadata{ETag: "registered-format", Size: int64(len(data))}
+	source := &fakeSource{data: data, metadata: []miniogateway.ObjectMetadata{metadata, metadata}}
+	repo := &fakeRepository{tx: &fakeTransaction{}}
+	service, _ := NewService(source, fakePlanLoader{plan: &Plan{
+		Parser: parserCfg, Repository: repo, BatchSize: 10, BatchMaxBytes: 4096,
+	}}, Options{MaxInputBytes: 8192, MaxRecordBytes: 4096, MaxDocumentBytes: 4096, MaxFields: 100})
+	result, err := service.Execute(context.Background(), validRequest())
+	if err != nil {
+		t.Fatalf("Execute() error = %v", err)
+	}
+	if result.TotalData != 2 || len(repo.tx.records) != 2 {
+		t.Fatalf("result/records = %#v/%d", result, len(repo.tx.records))
+	}
+	first := repo.tx.records[0].Fields
+	if first["transaction_time"] != "23:52:44" {
+		t.Fatalf("transaction_time = %#v", first["transaction_time"])
+	}
+	if date := first["transaction_date"].(model.Date); date.Format("2006-01-02") != "2024-02-22" {
+		t.Fatalf("transaction_date = %v", date)
+	}
+	if amount := first["transaction_amount"].(json.Number); amount.String() != "0" {
+		t.Fatalf("transaction_amount = %s", amount)
 	}
 }

@@ -113,6 +113,7 @@ func loadParserConfig(l *envLoader, skipEmptyLine bool) ParserConfig {
 		FixedWidthUnit:   "BYTE",
 		JSONMode:         JSONModeAuto,
 		DateFormat:       "2006-01-02",
+		TimeFormat:       "15:04:05",
 		DateTimeFormat:   time.RFC3339,
 		Timezone:         "UTC",
 		DefaultValues:    make(map[string]string),
@@ -138,11 +139,13 @@ func loadParserConfig(l *envLoader, skipEmptyLine bool) ParserConfig {
 	cfg.JSONRecordPath = l.stringValue("PARSER_JSON_RECORD_PATH", "")
 	cfg.XMLRecordPath = l.stringValue("PARSER_XML_RECORD_PATH", "")
 	cfg.DateFormat = l.stringValue("PARSER_DATE_FORMAT", cfg.DateFormat)
+	cfg.TimeFormat = l.stringValue("PARSER_TIME_FORMAT", cfg.TimeFormat)
 	cfg.DateTimeFormat = l.stringValue("PARSER_DATETIME_FORMAT", cfg.DateTimeFormat)
 	cfg.Timezone = l.stringValue("PARSER_TIMEZONE", cfg.Timezone)
 	cfg.TrimSpace = l.boolValue("PARSER_TRIM_SPACE", false)
 	cfg.NullIfEmpty = l.boolValue("PARSER_NULL_IF_EMPTY", false)
 	cfg.AllowExtraColumns = l.boolValue("PARSER_ALLOW_EXTRA_COLUMNS", false)
+	cfg.AllowMissingColumns = l.boolValue("PARSER_ALLOW_MISSING_COLUMNS", false)
 	cfg.MaxRecordBytes = l.intValue("PARSER_MAX_RECORD_BYTES", cfg.MaxRecordBytes)
 	cfg.MaxDocumentBytes = l.intValue("PARSER_MAX_DOCUMENT_BYTES", cfg.MaxDocumentBytes)
 	cfg.MaxFields = l.intValue("PARSER_MAX_FIELDS", cfg.MaxFields)

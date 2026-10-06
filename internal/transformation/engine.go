@@ -284,6 +284,18 @@ func (e *Engine) convert(value any, dataType config.DataType) (any, error) {
 			return nil, fmt.Errorf("value is not a valid date for the configured layout")
 		}
 		return model.NewDate(parsed), nil
+	case config.TypeTime:
+		layout := e.cfg.TimeFormat
+		if layout == "" {
+			layout = "15:04:05"
+		}
+		parsed, err := time.ParseInLocation(layout, strings.TrimSpace(toText(value)), e.location)
+		if err != nil {
+			return nil, fmt.Errorf("value is not a valid time for the configured layout")
+		}
+		// Bind a normalized SQL-compatible time string. This avoids attaching an
+		// artificial date to TIME columns in SQL Server, MySQL, or PostgreSQL.
+		return parsed.Format("15:04:05.999999999"), nil
 	case config.TypeDateTime:
 		if timestamp, ok := value.(time.Time); ok {
 			return timestamp, nil

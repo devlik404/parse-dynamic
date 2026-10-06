@@ -71,6 +71,60 @@ func TestDelimitedHeaderMismatchIsFatalBeforeRecords(t *testing.T) {
 	}
 }
 
+func TestDelimitedRecordFramingIsEntirelyConfigurationDriven(t *testing.T) {
+	cfg := config.ParserConfig{
+		FileType:            config.FileTypeDelimited,
+		Delimiter:           "|",
+		AllowMissingColumns: true,
+		Columns: []config.ColumnSpec{
+			{Name: "id", Type: config.TypeString},
+			{Name: "optional", Type: config.TypeString},
+		},
+		Mappings: []config.FieldMapping{
+			{Source: "1", Target: "id"},
+			{Source: "2", Target: "optional"},
+		},
+		Sectioned: config.SectionedDelimitedConfig{
+			RecordTypeIndex: 0,
+			FileHeaderCode:  "START",
+			DataCode:        "ROW",
+			FileFooterCode:  "END",
+			DataStartIndex:  1,
+		},
+	}
+	records, err := collectSources(t, cfg, "START|20260829\nROW|A|X\nROW|B\nEND|2\n")
+	if err != nil {
+		t.Fatalf("Parse() error = %v", err)
+	}
+	if len(records) != 2 {
+		t.Fatalf("records = %d, want only two configured data rows", len(records))
+	}
+	if records[0].Values["1"] != "A" || records[0].Values["2"] != "X" {
+		t.Fatalf("first values = %#v", records[0].Values)
+	}
+	if records[1].Values["1"] != "B" || records[1].Values["2"] != "" {
+		t.Fatalf("padded values = %#v", records[1].Values)
+	}
+}
+
+func TestDelimitedRecordFramingRejectsUnregisteredFrames(t *testing.T) {
+	cfg := config.ParserConfig{
+		FileType: config.FileTypeDelimited, Delimiter: "|",
+		Columns:  []config.ColumnSpec{{Name: "value", Type: config.TypeString}},
+		Mappings: []config.FieldMapping{{Source: "1", Target: "value"}},
+		Sectioned: config.SectionedDelimitedConfig{
+			RecordTypeIndex: 0, FileHeaderCode: "RH", DataCode: "DH", FileFooterCode: "RT", DataStartIndex: 1,
+		},
+	}
+	records, err := collectSources(t, cfg, "RH|x\nUNKNOWN|x\nRT|x\n")
+	if err == nil || !strings.Contains(err.Error(), "unrecognized record type") {
+		t.Fatalf("Parse() error = %v", err)
+	}
+	if len(records) != 0 {
+		t.Fatalf("records = %d, want none", len(records))
+	}
+}
+
 func TestCSVQuotedDelimiterAndMultilineWithHeader(t *testing.T) {
 	cfg := config.ParserConfig{
 		FileType:  config.FileTypeCSV,

@@ -93,11 +93,13 @@ type readerProfile struct {
 	JSONRecordPath        sql.NullString
 	XMLRecordPath         sql.NullString
 	DateFormat            string
+	TimeFormat            string
 	DateTimeFormat        string
 	Timezone              string
 	TrimSpace             bool
 	NullIfEmpty           bool
 	AllowExtraColumns     bool
+	AllowMissingColumns   bool
 	SkipEmptyLine         bool
 	MaxRecordBytes        int
 	MaxDocumentBytes      int
@@ -373,8 +375,8 @@ func (s *SQLStore) loadReaderProfile(ctx context.Context, db *sql.DB, request Re
 	query := fmt.Sprintf(`SELECT TOP (1)
     [ID], [FileType], [Delimiter], [HasHeader], [FixedWidthUnit],
     [JSONMode], [JSONRecordPath], [XMLRecordPath], [DateFormat],
-    [DateTimeFormat], [Timezone], [TrimSpace], [NullIfEmpty],
-    [AllowExtraColumns], [SkipEmptyLine], [MaxRecordBytes],
+    [TimeFormat], [DateTimeFormat], [Timezone], [TrimSpace], [NullIfEmpty],
+    [AllowExtraColumns], [AllowMissingColumns], [SkipEmptyLine], [MaxRecordBytes],
     [MaxDocumentBytes], [MaxFields], [SpreadsheetSheet], [HTMLTableIndex],
     [RecordTypeIndex], [SectionKeyIndex], [FileHeaderCode], [SectionHeaderCode],
     [DataCode], [SectionFooterCode], [FileFooterCode], [HeaderStartIndex],
@@ -386,8 +388,8 @@ ORDER BY [ConfigVersion] DESC, [ID] DESC`, s.qualified(s.config.ReaderTable))
 	err := db.QueryRowContext(ctx, query, request.ProductID, request.Task, request.Activity).Scan(
 		&profile.ID, &profile.FileType, &profile.Delimiter, &profile.HasHeader, &profile.FixedWidthUnit,
 		&profile.JSONMode, &profile.JSONRecordPath, &profile.XMLRecordPath, &profile.DateFormat,
-		&profile.DateTimeFormat, &profile.Timezone, &profile.TrimSpace, &profile.NullIfEmpty,
-		&profile.AllowExtraColumns, &profile.SkipEmptyLine, &profile.MaxRecordBytes,
+		&profile.TimeFormat, &profile.DateTimeFormat, &profile.Timezone, &profile.TrimSpace, &profile.NullIfEmpty,
+		&profile.AllowExtraColumns, &profile.AllowMissingColumns, &profile.SkipEmptyLine, &profile.MaxRecordBytes,
 		&profile.MaxDocumentBytes, &profile.MaxFields, &profile.SpreadsheetSheet, &profile.HTMLTableIndex,
 		&profile.RecordTypeIndex, &profile.SectionKeyIndex, &profile.FileHeaderCode, &profile.SectionHeaderCode,
 		&profile.DataCode, &profile.SectionFooterCode, &profile.FileFooterCode, &profile.HeaderStartIndex,
@@ -444,26 +446,28 @@ func compilePlan(
 	storeCfg StoreConfig,
 ) (config.ParserConfig, config.DBConfig, error) {
 	parserConfig := config.ParserConfig{
-		FileType:          config.FileType(strings.ToUpper(strings.TrimSpace(profile.FileType))),
-		Delimiter:         decodeDelimiter(profile.Delimiter.String),
-		HasHeader:         profile.HasHeader,
-		FixedWidthUnit:    strings.ToUpper(strings.TrimSpace(profile.FixedWidthUnit)),
-		JSONMode:          config.JSONMode(strings.ToUpper(strings.TrimSpace(profile.JSONMode))),
-		JSONRecordPath:    strings.TrimSpace(profile.JSONRecordPath.String),
-		XMLRecordPath:     strings.TrimSpace(profile.XMLRecordPath.String),
-		DateFormat:        profile.DateFormat,
-		DateTimeFormat:    profile.DateTimeFormat,
-		Timezone:          profile.Timezone,
-		TrimSpace:         profile.TrimSpace,
-		NullIfEmpty:       profile.NullIfEmpty,
-		AllowExtraColumns: profile.AllowExtraColumns,
-		SkipEmptyLine:     profile.SkipEmptyLine,
-		MaxRecordBytes:    profile.MaxRecordBytes,
-		MaxDocumentBytes:  profile.MaxDocumentBytes,
-		MaxFields:         profile.MaxFields,
-		SpreadsheetSheet:  profile.SpreadsheetSheet,
-		HTMLTableIndex:    profile.HTMLTableIndex,
-		DefaultValues:     make(map[string]string),
+		FileType:            config.FileType(strings.ToUpper(strings.TrimSpace(profile.FileType))),
+		Delimiter:           decodeDelimiter(profile.Delimiter.String),
+		HasHeader:           profile.HasHeader,
+		FixedWidthUnit:      strings.ToUpper(strings.TrimSpace(profile.FixedWidthUnit)),
+		JSONMode:            config.JSONMode(strings.ToUpper(strings.TrimSpace(profile.JSONMode))),
+		JSONRecordPath:      strings.TrimSpace(profile.JSONRecordPath.String),
+		XMLRecordPath:       strings.TrimSpace(profile.XMLRecordPath.String),
+		DateFormat:          profile.DateFormat,
+		TimeFormat:          profile.TimeFormat,
+		DateTimeFormat:      profile.DateTimeFormat,
+		Timezone:            profile.Timezone,
+		TrimSpace:           profile.TrimSpace,
+		NullIfEmpty:         profile.NullIfEmpty,
+		AllowExtraColumns:   profile.AllowExtraColumns,
+		AllowMissingColumns: profile.AllowMissingColumns,
+		SkipEmptyLine:       profile.SkipEmptyLine,
+		MaxRecordBytes:      profile.MaxRecordBytes,
+		MaxDocumentBytes:    profile.MaxDocumentBytes,
+		MaxFields:           profile.MaxFields,
+		SpreadsheetSheet:    profile.SpreadsheetSheet,
+		HTMLTableIndex:      profile.HTMLTableIndex,
+		DefaultValues:       make(map[string]string),
 		Sectioned: config.SectionedDelimitedConfig{
 			RecordTypeIndex:       profile.RecordTypeIndex,
 			SectionKeyIndex:       profile.SectionKeyIndex,
@@ -600,6 +604,9 @@ func defaultSourceSelector(parserConfig config.ParserConfig, column readerColumn
 		config.FileTypeHTML, config.FileTypeHTM, config.FileTypeXLS, config.FileTypeXLSX:
 		if parserConfig.HasHeader {
 			return column.SourceName
+		}
+		if parserConfig.FileType == config.FileTypeDelimited && strings.TrimSpace(parserConfig.Sectioned.DataCode) != "" {
+			return strconv.Itoa(parserConfig.Sectioned.DataStartIndex + column.Col - 1)
 		}
 		return strconv.Itoa(column.Col - 1)
 	case config.FileTypeRaw, config.FileTypeText:

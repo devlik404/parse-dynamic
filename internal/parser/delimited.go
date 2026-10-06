@@ -26,6 +26,7 @@ func (p *delimitedParser) Parse(ctx context.Context, r io.Reader, fileName strin
 	var lineNumber int64
 	var recordNumber int64
 	var header []string
+	framing := newStaticRecordFraming(p.cfg)
 
 	for scanner.Scan() {
 		lineNumber++
@@ -57,6 +58,15 @@ func (p *delimitedParser) Parse(ctx context.Context, r io.Reader, fileName strin
 			continue
 		}
 		fields := strings.Split(line, p.cfg.Delimiter)
+		if framing != nil {
+			isData, err := framing.accept(fields, lineNumber)
+			if err != nil {
+				return fmt.Errorf("parse %s at line %d: %w", fileName, lineNumber, err)
+			}
+			if !isData {
+				continue
+			}
+		}
 		if p.cfg.HasHeader && header == nil {
 			var err error
 			header, err = normalizeHeader(fields)
@@ -71,6 +81,7 @@ func (p *delimitedParser) Parse(ctx context.Context, r io.Reader, fileName strin
 
 		recordNumber++
 		expected := expectedFieldCount(p.cfg, header)
+		fields = padMissingFields(p.cfg, expected, fields)
 		if countMismatch(p.cfg, expected, len(fields)) {
 			recordErr := parseError(fileName, recordNumber, lineNumber, "", "COLUMN_COUNT_MISMATCH",
 				fmt.Sprintf("expected %d columns, got %d", expected, len(fields)), line)
@@ -95,6 +106,11 @@ func (p *delimitedParser) Parse(ctx context.Context, r io.Reader, fileName strin
 	}
 	if p.cfg.HasHeader && header == nil {
 		return fmt.Errorf("parse %s: header is missing", fileName)
+	}
+	if framing != nil {
+		if err := framing.finish(); err != nil {
+			return fmt.Errorf("parse %s: %w", fileName, err)
+		}
 	}
 	return nil
 }

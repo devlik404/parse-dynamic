@@ -62,6 +62,7 @@ const (
 	TypeFloat    DataType = "float"
 	TypeBoolean  DataType = "boolean"
 	TypeDate     DataType = "date"
+	TypeTime     DataType = "time"
 	TypeDateTime DataType = "datetime"
 	TypeUUID     DataType = "uuid"
 	TypeJSON     DataType = "json"
@@ -93,34 +94,36 @@ type InputConfig struct {
 }
 
 type ParserConfig struct {
-	FileType          FileType
-	Delimiter         string
-	HasHeader         bool
-	Columns           []ColumnSpec
-	Mappings          []FieldMapping
-	FixedWidthFields  []FixedWidthField
-	FixedWidthUnit    string
-	JSONMode          JSONMode
-	JSONRecordPath    string
-	XMLRecordPath     string
-	DateFormat        string
-	DateTimeFormat    string
-	Timezone          string
-	TrimSpace         bool
-	NullIfEmpty       bool
-	UppercaseFields   []string
-	LowercaseFields   []string
-	DefaultValues     map[string]string
-	Transforms        []TransformRule
-	RequiredFields    []string
-	MaxRecordBytes    int
-	MaxDocumentBytes  int
-	MaxFields         int
-	AllowExtraColumns bool
-	SkipEmptyLine     bool
-	SpreadsheetSheet  string
-	HTMLTableIndex    int
-	Sectioned         SectionedDelimitedConfig
+	FileType            FileType
+	Delimiter           string
+	HasHeader           bool
+	Columns             []ColumnSpec
+	Mappings            []FieldMapping
+	FixedWidthFields    []FixedWidthField
+	FixedWidthUnit      string
+	JSONMode            JSONMode
+	JSONRecordPath      string
+	XMLRecordPath       string
+	DateFormat          string
+	TimeFormat          string
+	DateTimeFormat      string
+	Timezone            string
+	TrimSpace           bool
+	NullIfEmpty         bool
+	UppercaseFields     []string
+	LowercaseFields     []string
+	DefaultValues       map[string]string
+	Transforms          []TransformRule
+	RequiredFields      []string
+	MaxRecordBytes      int
+	MaxDocumentBytes    int
+	MaxFields           int
+	AllowExtraColumns   bool
+	AllowMissingColumns bool
+	SkipEmptyLine       bool
+	SpreadsheetSheet    string
+	HTMLTableIndex      int
+	Sectioned           SectionedDelimitedConfig
 }
 
 // SectionedDelimitedConfig describes record framing only. Record codes are

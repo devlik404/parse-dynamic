@@ -21,6 +21,7 @@ func TestApplyOrderingRulesAndConversions(t *testing.T) {
 			{Name: "float", Type: config.TypeFloat},
 			{Name: "boolean", Type: config.TypeBoolean},
 			{Name: "date", Type: config.TypeDate},
+			{Name: "time", Type: config.TypeTime},
 			{Name: "datetime", Type: config.TypeDateTime},
 			{Name: "uuid", Type: config.TypeUUID},
 			{Name: "json", Type: config.TypeJSON},
@@ -28,6 +29,7 @@ func TestApplyOrderingRulesAndConversions(t *testing.T) {
 			{Name: "name", Type: config.TypeString},
 		},
 		DateFormat:      "20060102",
+		TimeFormat:      "150405",
 		DateTimeFormat:  "20060102 15:04:05",
 		Timezone:        "Asia/Jakarta",
 		TrimSpace:       true,
@@ -46,7 +48,7 @@ func TestApplyOrderingRulesAndConversions(t *testing.T) {
 	anyValue := map[string]any{"number": json.Number("1.20")}
 	record, recordErr := engine.Apply(model.Record{File: "x", RecordNumber: 1, Fields: map[string]any{
 		"integer": "42", "int64": "9223372036854775807", "decimal": "001.2300", "float": "2.5",
-		"boolean": "true", "date": "20260811", "datetime": "20260811 10:20:30",
+		"boolean": "true", "date": "20260811", "time": "235244", "datetime": "20260811 10:20:30",
 		"uuid": "550E8400-E29B-41D4-A716-446655440000", "json": `{"x":1}`, "any": anyValue, "name": "   ",
 	}})
 	if recordErr != nil {
@@ -63,6 +65,9 @@ func TestApplyOrderingRulesAndConversions(t *testing.T) {
 	}
 	if date := record.Fields["date"].(model.Date); date.Format("2006-01-02") != "2026-08-11" {
 		t.Fatalf("date = %v", date)
+	}
+	if record.Fields["time"] != "23:52:44" {
+		t.Fatalf("time = %#v", record.Fields["time"])
 	}
 	if datetime := record.Fields["datetime"].(time.Time); datetime.Location().String() != "Asia/Jakarta" {
 		t.Fatalf("datetime location = %v", datetime.Location())

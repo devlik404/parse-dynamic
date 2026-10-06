@@ -91,10 +91,7 @@ func expectedFieldCount(cfg config.ParserConfig, header []string) int {
 	if len(header) > 0 {
 		return len(header)
 	}
-	if len(cfg.Columns) > 0 {
-		return len(cfg.Columns)
-	}
-	maxIndex := -1
+	maxIndex := len(cfg.Columns) - 1
 	for _, mapping := range cfg.Mappings {
 		if index, err := strconv.Atoi(mapping.Source); err == nil && index > maxIndex {
 			maxIndex = index
@@ -122,7 +119,16 @@ func countMismatch(cfg config.ParserConfig, expected, actual int) bool {
 	if expected <= 0 {
 		return false
 	}
-	return actual < expected || (!cfg.AllowExtraColumns && actual > expected)
+	return (!cfg.AllowMissingColumns && actual < expected) || (!cfg.AllowExtraColumns && actual > expected)
+}
+
+func padMissingFields(cfg config.ParserConfig, expected int, fields []string) []string {
+	if !cfg.AllowMissingColumns || len(fields) >= expected {
+		return fields
+	}
+	padded := make([]string, expected)
+	copy(padded, fields)
+	return padded
 }
 
 func allFieldsEmpty(fields []string) bool {

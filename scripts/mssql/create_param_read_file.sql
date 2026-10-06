@@ -52,6 +52,8 @@ BEGIN TRY
             -- Value parsing and normalization.
             DateFormat                 NVARCHAR(100) NOT NULL
                 CONSTRAINT DF_ParamReadFile_DateFormat DEFAULT (N'2006-01-02'),
+            TimeFormat                 NVARCHAR(100) NOT NULL
+                CONSTRAINT DF_ParamReadFile_TimeFormat DEFAULT (N'15:04:05'),
             DateTimeFormat             NVARCHAR(100) NOT NULL
                 CONSTRAINT DF_ParamReadFile_DateTimeFormat
                 DEFAULT (N'2006-01-02T15:04:05Z07:00'),
@@ -63,6 +65,8 @@ BEGIN TRY
                 CONSTRAINT DF_ParamReadFile_NullIfEmpty DEFAULT (0),
             AllowExtraColumns          BIT NOT NULL
                 CONSTRAINT DF_ParamReadFile_AllowExtraColumns DEFAULT (0),
+            AllowMissingColumns        BIT NOT NULL
+                CONSTRAINT DF_ParamReadFile_AllowMissingColumns DEFAULT (0),
             SkipEmptyLine              BIT NOT NULL
                 CONSTRAINT DF_ParamReadFile_SkipEmptyLine DEFAULT (1),
 
@@ -197,7 +201,7 @@ BEGIN TRY
                 CHECK (DataType IN
                 (
                     'any', 'string', 'integer', 'int64', 'decimal',
-                    'float', 'boolean', 'date', 'datetime', 'uuid', 'json'
+                    'float', 'boolean', 'date', 'time', 'datetime', 'uuid', 'json'
                 )),
             CONSTRAINT CK_ParamReadFileColumn_FixedRange
                 CHECK
@@ -217,6 +221,46 @@ BEGIN TRY
                 CHECK (TransformConfigJSON IS NULL OR ISJSON(TransformConfigJSON) = 1)
         );
     END;
+
+    -- Upgrade aman ketika ParamReadFile dibuat oleh versi script sebelumnya.
+    IF COL_LENGTH(N'dbo.ParamReadFile', N'TimeFormat') IS NULL
+    BEGIN
+        ALTER TABLE dbo.ParamReadFile
+            ADD TimeFormat NVARCHAR(100) NOT NULL
+                CONSTRAINT DF_ParamReadFile_TimeFormat DEFAULT (N'15:04:05') WITH VALUES;
+    END;
+
+    IF COL_LENGTH(N'dbo.ParamReadFile', N'AllowMissingColumns') IS NULL
+    BEGIN
+        ALTER TABLE dbo.ParamReadFile
+            ADD AllowMissingColumns BIT NOT NULL
+                CONSTRAINT DF_ParamReadFile_AllowMissingColumns DEFAULT (0) WITH VALUES;
+    END;
+
+    -- Versi awal constraint belum memasukkan tipe time. Buat ulang secara
+    -- deterministik agar database existing memiliki kemampuan yang sama.
+    IF EXISTS
+    (
+        SELECT 1
+        FROM sys.check_constraints
+        WHERE parent_object_id = OBJECT_ID(N'dbo.ParamReadFileColumn')
+          AND name = N'CK_ParamReadFileColumn_DataType'
+    )
+    BEGIN
+        ALTER TABLE dbo.ParamReadFileColumn
+            DROP CONSTRAINT CK_ParamReadFileColumn_DataType;
+    END;
+
+    ALTER TABLE dbo.ParamReadFileColumn WITH CHECK
+        ADD CONSTRAINT CK_ParamReadFileColumn_DataType
+        CHECK
+        (
+            DataType IN
+            (
+                'any', 'string', 'integer', 'int64', 'decimal',
+                'float', 'boolean', 'date', 'time', 'datetime', 'uuid', 'json'
+            )
+        );
 
     -- Only one active reader profile is allowed for one scheduler identity.
     IF NOT EXISTS

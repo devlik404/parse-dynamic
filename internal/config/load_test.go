@@ -16,11 +16,13 @@ func TestLoadDelimitedComplete(t *testing.T) {
 	env["PARSER_HAS_HEADER"] = "true"
 	env["PARSER_MAPPING"] = "id:identifier,amount:amount"
 	env["PARSER_DATE_FORMAT"] = "20060102"
+	env["PARSER_TIME_FORMAT"] = "150405"
 	env["PARSER_DATETIME_FORMAT"] = "2006-01-02 15:04:05"
 	env["PARSER_TIMEZONE"] = "Asia/Jakarta"
 	env["PARSER_TRIM_SPACE"] = "true"
 	env["PARSER_NULL_IF_EMPTY"] = "true"
 	env["PARSER_ALLOW_EXTRA_COLUMNS"] = "true"
+	env["PARSER_ALLOW_MISSING_COLUMNS"] = "true"
 	env["PARSER_MAX_RECORD_BYTES"] = "2048"
 	env["PARSER_MAX_FIELDS"] = "5000"
 	env["PARSER_UPPERCASE_FIELDS"] = "identifier"
@@ -50,10 +52,10 @@ func TestLoadDelimitedComplete(t *testing.T) {
 	if cfg.Parser.Delimiter != "||" || !cfg.Parser.HasHeader {
 		t.Fatalf("unexpected delimiter/header config: %+v", cfg.Parser)
 	}
-	if cfg.Parser.DateFormat != "20060102" || cfg.Parser.Timezone != "Asia/Jakarta" {
+	if cfg.Parser.DateFormat != "20060102" || cfg.Parser.TimeFormat != "150405" || cfg.Parser.Timezone != "Asia/Jakarta" {
 		t.Fatalf("unexpected date config: %+v", cfg.Parser)
 	}
-	if cfg.Parser.MaxRecordBytes != 2048 || cfg.Parser.MaxFields != 5000 || !cfg.Parser.TrimSpace || !cfg.Parser.NullIfEmpty || !cfg.Parser.AllowExtraColumns {
+	if cfg.Parser.MaxRecordBytes != 2048 || cfg.Parser.MaxFields != 5000 || !cfg.Parser.TrimSpace || !cfg.Parser.NullIfEmpty || !cfg.Parser.AllowExtraColumns || !cfg.Parser.AllowMissingColumns {
 		t.Fatalf("parser flags were not loaded: %+v", cfg.Parser)
 	}
 	wantMappings := []FieldMapping{{Source: "id", Target: "identifier"}, {Source: "amount", Target: "amount"}}

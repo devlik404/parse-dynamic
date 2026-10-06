@@ -156,7 +156,7 @@ func validateParserProblems(parser ParserConfig) []string {
 
 	validTypes := map[DataType]bool{
 		TypeAny: true, TypeString: true, TypeInteger: true, TypeInt64: true, TypeDecimal: true,
-		TypeFloat: true, TypeBoolean: true, TypeDate: true, TypeDateTime: true,
+		TypeFloat: true, TypeBoolean: true, TypeDate: true, TypeTime: true, TypeDateTime: true,
 		TypeUUID: true, TypeJSON: true,
 	}
 	columnNames := make(map[string]struct{}, len(parser.Columns))
@@ -169,7 +169,7 @@ func validateParserProblems(parser ParserConfig) []string {
 			columnNames[column.Name] = struct{}{}
 		}
 		if !validTypes[column.Type] {
-			add("PARSER_TYPES entry %d must be one of string, integer, int64, decimal, float, boolean, date, datetime, uuid, json (any is reserved for inferred fields)", index+1)
+			add("PARSER_TYPES entry %d must be one of string, integer, int64, decimal, float, boolean, date, time, datetime, uuid, json (any is reserved for inferred fields)", index+1)
 		}
 	}
 	if len(parser.Columns) == 0 && validFileTypes[parser.FileType] {
@@ -291,6 +291,49 @@ func validateFormatSpecific(parser ParserConfig, validTypes map[DataType]bool, a
 	}
 	if parser.FileType == FileTypeSectionedDelimited {
 		validateSectionedDelimited(parser, add)
+	}
+	if parser.FileType == FileTypeDelimited && strings.TrimSpace(parser.Sectioned.DataCode) != "" {
+		validateRecordTypedDelimited(parser, add)
+	}
+}
+
+func validateRecordTypedDelimited(parser ParserConfig, add func(string, ...any)) {
+	cfg := parser.Sectioned
+	if parser.HasHeader {
+		add("PARSER_HAS_HEADER must be false when PARSER_DATA_CODE is configured for DELIMITED")
+	}
+	if cfg.RecordTypeIndex < 0 {
+		add("PARSER_RECORD_TYPE_INDEX must be zero or greater")
+	} else if parser.MaxFields > 0 && cfg.RecordTypeIndex >= parser.MaxFields {
+		add("PARSER_RECORD_TYPE_INDEX must be less than PARSER_MAX_FIELDS")
+	}
+	if cfg.DataStartIndex < 0 {
+		add("PARSER_DATA_START_INDEX must be zero or greater")
+	} else if cfg.DataStartIndex <= cfg.RecordTypeIndex {
+		add("PARSER_DATA_START_INDEX must be after PARSER_RECORD_TYPE_INDEX")
+	}
+	if strings.TrimSpace(cfg.SectionHeaderCode) != "" || strings.TrimSpace(cfg.SectionFooterCode) != "" {
+		add("section header/footer codes are only valid for SECTIONED_DELIMITED")
+	}
+	codes := []struct{ key, value string }{
+		{"PARSER_FILE_HEADER_CODE", cfg.FileHeaderCode},
+		{"PARSER_DATA_CODE", cfg.DataCode},
+		{"PARSER_FILE_FOOTER_CODE", cfg.FileFooterCode},
+	}
+	seen := make(map[string]string, len(codes))
+	for _, item := range codes {
+		value := strings.TrimSpace(item.value)
+		if value == "" {
+			continue
+		}
+		if strings.Contains(value, parser.Delimiter) || strings.ContainsAny(value, "\x00\r\n") {
+			add("%s must not contain the delimiter, NUL, CR, or LF", item.key)
+		}
+		if previous, duplicate := seen[value]; duplicate {
+			add("%s must differ from %s", item.key, previous)
+		} else {
+			seen[value] = item.key
+		}
 	}
 }
 
@@ -435,6 +478,16 @@ func validateParserOptions(parser ParserConfig, columns map[string]struct{}, add
 	}
 	if strings.TrimSpace(parser.DateTimeFormat) == "" {
 		add("PARSER_DATETIME_FORMAT must not be empty")
+	}
+	usesTime := false
+	for _, column := range parser.Columns {
+		if column.Type == TypeTime {
+			usesTime = true
+			break
+		}
+	}
+	if usesTime && strings.TrimSpace(parser.TimeFormat) == "" {
+		add("PARSER_TIME_FORMAT must not be empty when PARSER_TYPES contains time")
 	}
 	if strings.TrimSpace(parser.Timezone) == "" {
 		add("PARSER_TIMEZONE must not be empty")

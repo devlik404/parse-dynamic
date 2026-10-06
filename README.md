@@ -212,9 +212,11 @@ berisi `SS_RC_USER`, `SS_RC_PASSWORD`, serta `SCH_ENC_KEY`.
 | `PARSER_FILE_TYPE` | `DELIMITED`, `CSV`, `TSV`, `FIXED_WIDTH`, `JSON`, `XML`, `RAW`, `TEXT`, `HTML`, `HTM`, `PDF`, `XLS`, `XLSX`, atau `SECTIONED_DELIMITED` |
 | `PARSER_COLUMNS` / `PARSER_TYPES` | Skema canonical terurut dan tipe data yang dikonfigurasi |
 | `PARSER_MAPPING` | Mapping selector sumber ke field canonical |
+| `PARSER_TIME_FORMAT` | Layout Go untuk tipe `time`, misalnya `150405` untuk sumber `HHmmss` |
 | `PARSER_MAX_RECORD_BYTES` | Batas byte mutlak untuk satu record logis (default 1 MiB) |
 | `PARSER_MAX_DOCUMENT_BYTES` | Batas input/unpacked document untuk PDF/XLS/XLSX (default 64 MiB) |
 | `PARSER_MAX_FIELDS` | Batas jumlah field/node per record (default 10.000) |
+| `PARSER_ALLOW_MISSING_COLUMNS` | Mengizinkan field bagian akhir yang tidak tersedia dan mengisinya sebagai kosong/NULL |
 | `PARSER_SPREADSHEET_SHEET` | Nama worksheet XLS/XLSX atau indeks zero-based (default `0`) |
 | `PARSER_HTML_TABLE_INDEX` | Indeks tabel HTML zero-based (default `0`) |
 | `DB_DRIVER` | Adapter yang tersedia: `postgres`, `mysql`, atau `sqlserver` |
@@ -266,6 +268,34 @@ PARSER_MAPPING=id:transaction_id,date:transaction_date,bank:bank,amount:amount
 ```
 
 Header divalidasi sebelum record pertama dihasilkan atau dimasukkan ke database.
+
+### Record bertipe seperti RH/DH/RT
+
+File delimited dapat memiliki record header, data, dan trailer dengan jumlah field yang berbeda.
+Konfigurasi berikut membuat engine hanya menghasilkan record `DH`; kode `RH`, `DH`, dan `RT` tetap
+merupakan parameter, bukan hardcode produk:
+
+```dotenv
+PARSER_FILE_TYPE=DELIMITED
+PARSER_DELIMITER=|
+PARSER_HAS_HEADER=false
+PARSER_RECORD_TYPE_INDEX=0
+PARSER_FILE_HEADER_CODE=RH
+PARSER_DATA_CODE=DH
+PARSER_FILE_FOOTER_CODE=RT
+PARSER_DATA_START_INDEX=1
+PARSER_ALLOW_EXTRA_COLUMNS=true
+PARSER_ALLOW_MISSING_COLUMNS=true
+PARSER_DATE_FORMAT=20060102
+PARSER_TIME_FORMAT=150405
+```
+
+Header dan trailer divalidasi urutannya tetapi tidak dikirim ke mapping atau database. Hanya record
+dengan kode `PARSER_DATA_CODE` yang dihitung sebagai `total_data`. Contoh parameter lengkap untuk
+format QRIS tersedia di
+[`scripts/mssql/configure_qris_tap_reader.sql`](scripts/mssql/configure_qris_tap_reader.sql), sedangkan
+mapping target central tersedia di
+[`scripts/mssql/configure_qris_tap_target_mapping.sql`](scripts/mssql/configure_qris_tap_target_mapping.sql).
 
 ### Header dinamis per section
 
@@ -368,7 +398,7 @@ membutuhkan random access; file dihapus setelah parsing. Dokumen terenkripsi dit
 ## Transformasi dan tipe data
 
 Tipe yang didukung adalah `string`, `integer`, `int64`, `decimal` presisi exact, `float`, `boolean`,
-`date`, `datetime`, `uuid`, dan `json`. Nilai kosong tidak otomatis diubah menjadi angka nol.
+`date`, `time`, `datetime`, `uuid`, dan `json`. Nilai kosong tidak otomatis diubah menjadi angka nol.
 
 Pengaturan praktis mencakup trim, null-if-empty, field uppercase/lowercase, default value, dan
 required field. Rule lanjutan yang berurutan menggunakan JSON pada ENV:
